@@ -1,0 +1,7 @@
+.git/
+.github/
+*.log
+.DS_Store
+Thumbs.db
+*.tsbuildinfo
+coverage/

@@ -27,7 +27,9 @@
     "vendor/channel-pack/LICENSE",
     "vendor/channel-pack/NOTICE.md",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "vendor/channel-pack/qoder-auth-wasm.wasm",
+    "LICENSE"
   ],
   "license": "MIT",
   "dsh": {
@@ -45,5 +47,25 @@
     "@deepseek-ai/dsh-credentials": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1",
     "@deepseek-ai/dsh-llm": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1",
     "@deepseek-ai/schemastery": "^3.18.4"
-  }
+  },
+  "repository": {
+    "url": "git+https://github.com/Zhouhang9527/dsh-auth-hub.git",
+    "type": "git"
+  },
+  "homepage": "https://github.com/Zhouhang9527/dsh-auth-hub#readme",
+  "bugs": {
+    "url": "https://github.com/Zhouhang9527/dsh-auth-hub/issues"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "account",
+    "auth",
+    "checkin",
+    "credit",
+    "rotation",
+    "channel-pack"
+  ],
+  "author": "Zhouhang9527"
 }
