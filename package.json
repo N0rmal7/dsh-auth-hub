@@ -1,0 +1,47 @@
+{
+  "name": "dsh-auth-hub",
+  "displayName": "DSH 账号中心",
+  "version": "0.3.0",
+  "description": "统一账号中心：把 dsh-our-free-model 的 13 个渠道账号与 dsh-workbuddy 的国内/国际账号登录、状态、积分领取整合到一个设置页（界面风格对齐 DSH WorkBuddy）。",
+  "type": "module",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "rotation.js",
+    "rotation-router.js",
+    "workbuddy-growth.js",
+    "credit-usage.js",
+    "channel-pack.js",
+    "vendor/channel-pack/pack.js",
+    "vendor/channel-pack/LICENSE",
+    "vendor/channel-pack/NOTICE.md",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": []
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-credentials": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1",
+    "@deepseek-ai/dsh-llm": "^0.1.2-rc.1 || ^0.1.7-rc.2 || ^0.2.0-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.4"
+  }
+}

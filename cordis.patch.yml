@@ -1,0 +1,13 @@
+# dsh-auth-hub bundle patch.
+#
+# 一行 insert 即挂载 Host 半身；浏览器半身由 package.json 的 dsh.client 声明，
+# 并绑定在 name 为裸包名的这一行上（子路径行不会携带半身）。
+#
+# ⚠️ `id` 必须与浏览器半身 `window.__ModuleLoader__.load({ id })` 里的 id **一致**。
+# 不一致时的现象极具迷惑性：bundle 照常下载、factory 照常注册，但没有任何模块
+# 去 import 它，`apply()` 永远不会执行 —— 设置里没有这一项，而控制台**一条错误
+# 都没有**（实测踩过：这里写 auth-hub，client.js 里却是 dsh-auth-hub）。
+- insert:
+    - id: dsh-auth-hub
+      name: 'dsh-auth-hub'
+      config: {}
