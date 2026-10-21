@@ -5,6 +5,11 @@
  * `dsh-our-free-model`，13 个渠道的登录 / 账号池 / 积分领取），所以不再需要装
  * 那个插件。WorkBuddy 的双区登录也走内置 pack。
  *
+ * v0.4.0 起还多了一层**自己加的签到渠道**（`checkin-channels.js` +
+ * `checkin-runner.js`）：内置那 13 个渠道必须逆向登录协议才能加，而「每日签到」
+ * 这件事只是一发 HTTP + JSON 判成败，所以它被做成了声明式配置——粘一条 cURL
+ * 就能接一个新站点，每天自动签、奖励进同一个积分台账。
+ *
  * 路由（都在本插件的 web 服务上，`/plugins/dsh-auth-hub/*`）：
  *   GET  status         内置 channel-pack 是否挂载 + controlKey + 文件路径 + 轮换路由状态
  *   GET  policy         每账号积分上限 + 今日已用积分 + 余额基线
@@ -13,6 +18,10 @@
  *   POST credit-grant   记录一次「领取成功」的积分（签到已由 pack 自己记，这里是补录口）
  *   GET  rotations      轮换组 + 今日各候选用量 + 预览顺序
  *   POST rotations      写入轮换组（需 controlKey），并广播 `llm/adapters-updated`
+ *   GET  checkin        签到渠道 + 今日状态 + 模板（密钥只给掩码）
+ *   POST checkin        写入签到渠道（需 controlKey）
+ *   POST checkin-run    立即签到（需 controlKey；`{ ids?, force? }`）
+ *   POST checkin-parse  把一条 cURL 拆成渠道草稿（需 controlKey）
  *
  * 另有内置 channel-pack 自己挂的 `/api/channel-pack`（connection RPC，浏览器侧用）
  * 与 `/api/channel-pack/captcha-carrier`（ZCode 验证码载体页）。
@@ -44,6 +53,21 @@ import { mountChannelPack } from './channel-pack.js'
 import { normalizeRotations, parseMember, pruneRotationState, rotationOrder } from './rotation.js'
 import { ROUTER_PROVIDER, ROUTER_PROVIDER_NAME, createRotationAdapter, previewRoute } from './rotation-router.js'
 import { fetchGrowthStatus, fetchGrowthStreakDays, fetchGrowthTasks, fetchGrowthRewardToday, runGrowthSweep } from './workbuddy-growth.js'
+import {
+  CHECKIN_CHANNELS_FILE,
+  CHECKIN_SECRETS_FILE,
+  CHECKIN_SETTINGS_FILE,
+  CHECKIN_STATE_FILE,
+  channelView,
+  draftFromTemplate,
+  newApiDraft,
+  parseCurl,
+  parseSiteList,
+  pickNewApiUser,
+  templateView,
+  utc8Clock,
+} from './checkin-channels.js'
+import { probeNewApiSite, readCheckinStore, runCheckinBatch, writeCheckinStore } from './checkin-runner.js'
 
 export const name = 'auth-hub'
 export const inject = []
@@ -62,6 +86,11 @@ export const SAMPLE_PATH = '/plugins/dsh-auth-hub/credit-sample'
 export const GRANT_PATH = '/plugins/dsh-auth-hub/credit-grant'
 export const ROTATIONS_PATH = '/plugins/dsh-auth-hub/rotations'
 export const GROWTH_PATH = '/plugins/dsh-auth-hub/growth'
+export const CHECKIN_PATH = '/plugins/dsh-auth-hub/checkin'
+export const CHECKIN_RUN_PATH = '/plugins/dsh-auth-hub/checkin-run'
+export const CHECKIN_PARSE_PATH = '/plugins/dsh-auth-hub/checkin-parse'
+export const CHECKIN_PROBE_PATH = '/plugins/dsh-auth-hub/checkin-probe'
+export const CHECKIN_IMPORT_PATH = '/plugins/dsh-auth-hub/checkin-import'
 const CONTROL_KEY_HEADER = 'x-auth-hub-control-key'
 const controlKey = randomBytes(24).toString('hex')
 
@@ -220,13 +249,38 @@ function policyView() {
       samples: usage.days?.[day]?.providers?.[id]?.samples ?? 0,
     }
   }
-  return { day, accounts, providers, policy, baseline: usage.baseline, grantsToday: grantsToday(usage, day) }
+  return {
+    day,
+    accounts,
+    providers,
+    policy,
+    baseline: usage.baseline,
+    grantsToday: grantsToday(usage, day),
+    // 签到渠道的奖励也走同一个 grants 台账，所以这里要单独列出来：用户看到
+    // 「今日领取」这个数字时，才知道它包含了哪些来源（内置签到 + 自己加的渠道）。
+    grants: grantsTodayDetail(usage, day),
+  }
 }
 
 function grantsToday(usage, day) {
   const start = Date.parse(`${day}T00:00:00+08:00`)
   const rows = (usage.grants ?? []).filter(row => row.at >= start)
   return rows.reduce((sum, row) => sum + row.amount, 0)
+}
+
+/** 今日领取流水（按渠道汇总），给「积分上限」页显示「这些数字是怎么来的」。 */
+function grantsTodayDetail(usage, day) {
+  const start = Date.parse(`${day}T00:00:00+08:00`)
+  const rows = (usage.grants ?? []).filter(row => row.at >= start)
+  const byProvider = new Map()
+  for (const row of rows) {
+    const key = row.provider === '' ? '(unknown)' : row.provider
+    const row2 = byProvider.get(key) ?? { provider: key, amount: 0, count: 0 }
+    row2.amount = Math.round((row2.amount + row.amount) * 100) / 100
+    row2.count += 1
+    byProvider.set(key, row2)
+  }
+  return [...byProvider.values()].sort((a, b) => b.amount - a.amount)
 }
 
 /** 账号池（`state.json`）里的账号：登录态、昵称、启停。 */
@@ -300,15 +354,104 @@ function memberExhausted(member, policy = readPolicy()) {
   return accounts.every(account => accountExhausted(account.id, policy))
 }
 
+/**
+ * 签到渠道视图。
+ *
+ * 只给**掩码**：`headers` 里的 Cookie / Authorization 是登录态，`/checkin` 的
+ * 响应会进浏览器内存与 DevTools，回显原文等于把它交给每一个能开这个页面的人。
+ * 界面按 `headerHints` 显示「已配置 Cookie: abc…xyz」，保存时只提交用户**改过**
+ * 的头（`undefined` = 保持原值，`''` = 删除）。
+ */
+function checkinView() {
+  const store = readCheckinStore(stateDir())
+  return {
+    day: utc8Day(),
+    clock: utc8Clock(),
+    settings: store.settings,
+    templates: templateView(),
+    channels: store.channels.map(channel => channelView(channel, store.secrets[channel.id], store.state[channel.id])),
+    files: {
+      channels: path.join(stateDir(), CHECKIN_CHANNELS_FILE),
+      secrets: path.join(stateDir(), CHECKIN_SECRETS_FILE),
+      state: path.join(stateDir(), CHECKIN_STATE_FILE),
+      settings: path.join(stateDir(), CHECKIN_SETTINGS_FILE),
+    },
+  }
+}
+
+/**
+ * 把界面提交的渠道合并进现有配置。
+ *
+ * 密钥的处理是这个函数唯一有坑的地方，而且**不能靠「空串」表达两种意思**：
+ * 界面拿不到原文（Host 只回掩码），所以「没改动」和「要删除」必须用两种形状区分：
+ *
+ *   - `headers[name]` 是**非空字符串** → 覆盖成这个新值；
+ *   - `headers` 里**没有这个键**           → 保持原值（用户压根没碰）；
+ *   - 名字出现在 `removeHeaders[]` 里      → 删除。
+ *
+ * 早先版本用「空串 = 保持」，结果用户真的想清掉一个头时永远清不掉；反过来用
+ * 「空串 = 删除」，改个 Referer 就会把 Cookie 一起洗掉、第二天全挂。两种都试过，
+ * 显式的 `removeHeaders` 才没有歧义。
+ */
+function mergeCheckinChannels(incoming) {
+  const store = readCheckinStore(stateDir())
+  const rows = []
+  for (const raw of Array.isArray(incoming) ? incoming : []) {
+    if (raw === null || typeof raw !== 'object') continue
+    const id = typeof raw.id === 'string' ? raw.id.trim() : ''
+    const old = store.secrets[id] ?? {}
+    const headers = { ...old }
+    const incomingHeaders = raw.headers !== null && typeof raw.headers === 'object' ? raw.headers : {}
+    for (const [name, value] of Object.entries(incomingHeaders)) {
+      if (typeof value !== 'string') continue
+      const trimmed = value.trim()
+      if (trimmed !== '') headers[name] = trimmed
+    }
+    for (const name of Array.isArray(raw.removeHeaders) ? raw.removeHeaders : []) {
+      if (typeof name === 'string') delete headers[name]
+    }
+    rows.push({ ...raw, headers })
+  }
+  const written = writeCheckinStore(stateDir(), {
+    channels: rows,
+    secrets: Object.fromEntries(rows.map(row => [row.id, row.headers ?? {}])),
+  })
+  // 渠道被删掉时，它的签到状态也要一起清 —— 否则同名渠道重建后会「继承」上一次
+  // 的 lastDay，导致今天永远不再自动签。
+  pruneCheckinState(written.channels)
+  return written
+}
+
+/** 状态文件剪枝：只保留仍然存在的渠道。 */
+function pruneCheckinState(channels) {
+  const file = path.join(stateDir(), CHECKIN_STATE_FILE)
+  const raw = readJsonFile(file, { channels: {} })
+  const rows = raw !== null && typeof raw === 'object' && raw.channels !== null && typeof raw.channels === 'object' ? raw.channels : {}
+  const live = new Set((Array.isArray(channels) ? channels : []).map(channel => channel.id))
+  const next = {}
+  for (const [id, value] of Object.entries(rows)) if (live.has(id)) next[id] = value
+  if (Object.keys(next).length !== Object.keys(rows).length) writeJsonFile(file, { version: 1, channels: next })
+  return next
+}
+
 function diagnostics() {
+  const store = readCheckinStore(stateDir())
   return {
     plugin: 'dsh-auth-hub',
     controlKey,
     channelPack: { ...channelPackState },
     router: { ...routerState },
+    checkin: {
+      channels: store.channels.length,
+      enabled: store.channels.filter(channel => channel.enabled !== false).length,
+      auto: store.settings.auto,
+      at: store.settings.at,
+      dueNow: store.channels.filter(channel => channel.enabled !== false && store.state[channel.id]?.lastDay !== utc8Day()).length,
+    },
     policyFile: policyFile(),
     creditUsageFile: creditUsageFile(),
     rotationsFile: rotationsFile(),
+    checkinFile: path.join(stateDir(), CHECKIN_CHANNELS_FILE),
     backends: BACKENDS.map(backend => ({
       id: backend.id,
       label: backend.label,
@@ -568,6 +711,222 @@ export function apply(ctx) {
             }
           },
         }),
+        scoped.webServer.register({
+          kind: 'exact',
+          path: CHECKIN_PATH,
+          handler: async (req, res) => {
+            // 签到渠道：`GET` 读全量（密钥只给掩码），`POST` 写全量。
+            if (req.method === 'GET') return send(res, 200, checkinView())
+            if (req.method !== 'POST') return send(res, 405, { error: 'method not allowed' })
+            if (!keyMatches(req.headers[CONTROL_KEY_HEADER])) return send(res, 403, { error: 'invalid-control-key' })
+            const body = await readJson(req)
+            if (body === undefined) return send(res, 400, { error: 'body is not JSON' })
+            try {
+              const written = mergeCheckinChannels(body?.channels)
+              if (body?.settings !== undefined) {
+                writeCheckinStore(stateDir(), { channels: written.channels, secrets: written.secrets, settings: body.settings })
+              }
+              if (written.problems.length > 0) {
+                warn(`auth-hub: 签到渠道有 ${written.problems.length} 条被丢弃：${written.problems.join('；')}`)
+              }
+              info(`auth-hub: 已保存 ${written.channels.length} 个签到渠道`)
+              send(res, 200, { ok: true, problems: written.problems, ...checkinView() })
+            } catch (error) {
+              send(res, 500, { error: error instanceof Error ? error.message : String(error) })
+            }
+          },
+        }),
+        scoped.webServer.register({
+          kind: 'exact',
+          path: CHECKIN_RUN_PATH,
+          handler: async (req, res) => {
+            // 立即签到：`{ ids?: string[], force?: boolean }`。
+            //
+            // `force` 让手动执行无视「今天已签」——用户刚换了 Cookie 时想看新配置
+            // 是不是通的，这时候跳过反而是坏体验。
+            if (req.method !== 'POST') return send(res, 405, { error: 'method not allowed' })
+            if (!keyMatches(req.headers[CONTROL_KEY_HEADER])) return send(res, 403, { error: 'invalid-control-key' })
+            const body = await readJson(req)
+            try {
+              const ids = Array.isArray(body?.ids) ? body.ids.filter(id => typeof id === 'string') : undefined
+              const result = await runCheckinBatch({
+                dir: stateDir(),
+                ids,
+                force: body?.force === true,
+                recordGrant: (provider, accountId, amount, at) => recordCreditGrant(creditUsageFile(), provider, accountId, amount, at),
+                info,
+                warn,
+              })
+              send(res, 200, { ok: true, ...result, ...checkinView() })
+            } catch (error) {
+              send(res, 500, { error: error instanceof Error ? error.message : String(error) })
+            }
+          },
+        }),
+        scoped.webServer.register({
+          kind: 'exact',
+          path: CHECKIN_PARSE_PATH,
+          handler: async (req, res) => {
+            // 「粘贴一条 cURL」→ 草稿。手抄 Cookie 与 body 太容易错，而浏览器
+            // 右键「Copy as cURL」是一键的；这一步把那份文本拆成表单字段。
+            if (req.method !== 'POST') return send(res, 405, { error: 'method not allowed' })
+            if (!keyMatches(req.headers[CONTROL_KEY_HEADER])) return send(res, 403, { error: 'invalid-control-key' })
+            const body = await readJson(req)
+            if (typeof body?.curl !== 'string') return send(res, 400, { error: 'curl is required' })
+            const parsed = parseCurl(body.curl)
+            if (parsed.draft === undefined) return send(res, 400, { error: parsed.problem ?? 'cURL 无法解析' })
+            const taken = new Set(readCheckinStore(stateDir()).channels.map(channel => channel.id))
+            // 顺手把 cURL 里的 New-Api-User 摘出来：用户手抄到表单里最容易漏的就是
+            // 这个头，而漏了它每个接口都 401、报错还完全不提。
+            const userId = pickNewApiUser(parsed.draft.headers)
+            if (userId !== '') {
+              const match = /^(https?:\/\/[^/]+)/i.exec(parsed.draft.url ?? '')
+              const generated = match === null ? undefined : newApiDraft(match[1], { userId, takenIds: taken })
+              if (generated !== undefined) {
+                // 只借用生成的判定规则与奖励路径，URL/方法/body 仍用 cURL 里的真值。
+                return send(res, 200, {
+                  ok: true,
+                  draft: {
+                    ...generated,
+                    ...parsed.draft,
+                    id: generated.id,
+                    label: generated.label,
+                    siteOrigin: generated.siteOrigin,
+                    template: 'newapi',
+                    success: generated.success,
+                    already: generated.already,
+                    reward: generated.reward,
+                    rewardUnit: generated.rewardUnit,
+                    note: '',
+                  },
+                  detected: 'newapi',
+                  templates: templateView(),
+                })
+              }
+            }
+            const slug = parsed.draft.label.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 24)
+            const draft = { ...draftFromTemplate('cookie-get', taken), ...parsed.draft, id: slug === '' ? 'checkin' : slug }
+            send(res, 200, { ok: true, draft, templates: templateView() })
+          },
+        }),
+        scoped.webServer.register({
+          kind: 'exact',
+          path: CHECKIN_PROBE_PATH,
+          handler: async (req, res) => {
+            // 「一键识别中转站」：给个域名，探出它是哪家的、签到端点在哪、规则怎么写。
+            //
+            // ⚠️ 这一步**可能真的把今天的签到用掉**（New API 的成功/已签只能由签到
+            // 接口本身给出）。所以界面上必须写明这一句，不能偷偷跑。
+            if (req.method !== 'POST') return send(res, 405, { error: 'method not allowed' })
+            if (!keyMatches(req.headers[CONTROL_KEY_HEADER])) return send(res, 403, { error: 'invalid-control-key' })
+            const body = await readJson(req)
+            if (typeof body?.origin !== 'string' || body.origin.trim() === '') return send(res, 400, { error: 'origin is required' })
+            try {
+              const probe = await probeNewApiSite(body.origin.trim(), {
+                cookie: typeof body?.cookie === 'string' ? body.cookie : '',
+                userId: typeof body?.userId === 'string' ? body.userId : '',
+              })
+              const taken = new Set(readCheckinStore(stateDir()).channels.map(channel => channel.id))
+              const draft = probe.isNewApi
+                ? newApiDraft(probe.origin, {
+                  userId: typeof body?.userId === 'string' ? body.userId : '',
+                  cookie: typeof body?.cookie === 'string' ? body.cookie : '',
+                  takenIds: taken,
+                  ...(probe.signPath === undefined ? {} : { signPath: probe.signPath }),
+                })
+                : undefined
+              if (probe.isNewApi) info(`auth-hub: 识别到 New API 站点 ${probe.origin}（${probe.message}）`)
+              send(res, 200, {
+                ok: true,
+                probe,
+                ...(draft === undefined ? {} : { draft }),
+                templates: templateView(),
+              })
+            } catch (error) {
+              send(res, 500, { error: error instanceof Error ? error.message : String(error) })
+            }
+          },
+        }),
+        scoped.webServer.register({
+          kind: 'exact',
+          path: CHECKIN_IMPORT_PATH,
+          handler: async (req, res) => {
+            // 批量加中转站：一行一个域名，共用一份 Cookie / 用户 ID，返回草稿数组。
+            //
+            // 这里**不写盘**：导出的草稿交给界面，用户看过、改过、确认后才走 POST
+            // /checkin 保存。批量导入最怕的就是「一按就把 20 个没验证的渠道写进去」。
+            if (req.method !== 'POST') return send(res, 405, { error: 'method not allowed' })
+            if (!keyMatches(req.headers[CONTROL_KEY_HEADER])) return send(res, 403, { error: 'invalid-control-key' })
+            const body = await readJson(req)
+            if (typeof body?.sites !== 'string') return send(res, 400, { error: 'sites is required' })
+            const store = readCheckinStore(stateDir())
+            const taken = new Set(store.channels.map(channel => channel.id))
+            const userId = typeof body?.userId === 'string' ? body.userId.trim() : ''
+            // 用户 ID 允许从粘进来的一小段请求头里自动认（`New-Api-User: 12345`）。
+            const resolvedUserId = userId !== '' ? userId : pickNewApiUser({ 'New-Api-User': String(body?.userId ?? '') })
+            const parsed = parseSiteList(body.sites, {
+              cookie: typeof body?.cookie === 'string' ? body.cookie : '',
+              userId: resolvedUserId,
+              takenIds: taken,
+            })
+            if (parsed.drafts.length > 0) info(`auth-hub: 批量生成 ${parsed.drafts.length} 个中转站草稿`)
+            send(res, 200, { ok: true, ...parsed, count: parsed.drafts.length, templates: templateView() })
+          },
+        }),
+        // ── 签到渠道的自动执行 ──────────────────────────────────────────────
+        //
+        // 60 秒一次的定时器 + 幂等判据（`isDue`：日期、钟点、重试间隔、当天尝试
+        // 次数都在里面）。为什么不用 setTimeout 算到下一个整点：机器休眠/唤醒后
+        // 定时器会漂，而「每轮比较一次」的幂等判据怎么漂都不会漏签或重签。
+        //
+        // ⚠️ 这里**不要**再自己判一遍「到点没」：早期版本在这里另写了一份
+        // `clock >= scheduleAt` 的判断，结果绕过了 `isDue` 里的失败重试——
+        // 一次网络抖动把 lastDay 写成今天后，调度器永远认为「今天处理过了」。
+        scoped.effect(() => {
+          let stopped = false
+          const tick = async () => {
+            if (stopped) return
+            try {
+              const store = readCheckinStore(stateDir())
+              if (store.settings.auto !== true) return
+              const nowMs = Date.now()
+              const day = utc8Day(nowMs)
+              const clock = utc8Clock(nowMs)
+              const settings = store.settings
+              const catchUp = settings.catchUpOnStart === true
+              // 到点（含失败后到重试间隔的）：isDue 是唯一判据，别在这里再抄一份
+              // 「clock >= scheduleAt」——早期版本抄过，结果绕过了失败重试。
+              const targets = store.channels.filter(channel => isDue(channel, store.state[channel.id], nowMs, settings))
+                .filter(channel => {
+                  if (catchUp) return true
+                  // 关掉开机补签：只签「恰好到这个钟点」的，避免启动瞬间连打十几个站。
+                  if ((channel.scheduleAt ?? '00:00') === clock) return true
+                  // 但**今天已经失败过**的照跑：那是「找回今天的额度」，不是「提前签」。
+                  const state = store.state[channel.id]
+                  return state?.lastDay === day && state?.lastStatus === 'error'
+                })
+              if (targets.length === 0) return
+              const result = await runCheckinBatch({
+                dir: stateDir(),
+                ids: targets.map(channel => channel.id),
+                recordGrant: (provider, accountId, amount, at) => recordCreditGrant(creditUsageFile(), provider, accountId, amount, at),
+                info,
+                warn,
+              })
+              if (result.ran > 0) info(`auth-hub: 自动签到 ${result.ran} 个渠道（${day}）`)
+            } catch (error) {
+              warn(`auth-hub: 自动签到扫描失败：${error instanceof Error ? error.message : String(error)}`)
+            }
+          }
+          const timer = setInterval(() => { void tick() }, 60_000)
+          // 挂载后 20 秒补一次（避开启动高峰）；这就是「开机 30 秒内自动签到」。
+          const boot = setTimeout(() => { void tick() }, 20_000)
+          return () => {
+            stopped = true
+            clearInterval(timer)
+            clearTimeout(boot)
+          }
+        }, 'auth-hub: checkin scheduler'),
       ]
       return () => { for (const dispose of disposers) dispose() }
     }, 'auth-hub: account routes')

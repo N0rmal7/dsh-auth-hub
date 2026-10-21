@@ -131,6 +131,98 @@ export function routerOrderFor(group, state, options = {}) {
   return { order: usable, skipped }
 }
 
+/**
+ * 语义档位：把各渠道五花八门的 effort id 归一到同一把尺子上。
+ *
+ * 为什么需要：账号渠道对「思考档位」的命名完全不统一——CodeArts 只有
+ * `on` / `off` 两个开关，buddy / workbuddy 用的是 `low` / `medium` / `high` /
+ * `xhigh` / `max`，还有的渠道用 `minimal`、`balanced`。轮换组把同一模型的多个
+ * 渠道并在一起后，**会话里只存了一个 effort id**（由组的首选候选的能力表决定），
+ * 转发给另一个候选时它未必认识——DSH 的 `resolveCallConfig` 明确写着
+ * 「no clamping or aliasing is performed」，不认识的档位会在打上游之前直接抛
+ * `provider "x" model "y" does not support reasoning effort "z"`。
+ * 所以转发前必须自己把档位翻译成目标渠道认识的 id（见 `chooseEffort`）。
+ */
+const EFFORT_RANKS = [
+  { rank: 0, ids: ['off', 'none', 'disabled', 'disable', 'no', 'closed'] },
+  { rank: 1, ids: ['minimal', 'min', 'tiny'] },
+  { rank: 2, ids: ['low', 'light'] },
+  { rank: 3, ids: ['medium', 'mid', 'balanced', 'normal', 'standard'] },
+  { rank: 4, ids: ['high', 'on', 'default', 'auto', 'enabled', 'open'] },
+  { rank: 5, ids: ['xhigh', 'extra-high', 'very-high'] },
+  { rank: 6, ids: ['max', 'maximum', 'ultra', 'highest'] },
+]
+const EFFORT_RANK_BY_ID = new Map()
+for (const row of EFFORT_RANKS) for (const id of row.ids) EFFORT_RANK_BY_ID.set(id, row.rank)
+
+/** effort id → 语义档位（0=关，6=最高）；未知 id 返回 undefined。 */
+export function effortRank(id) {
+  if (typeof id !== 'string') return undefined
+  return EFFORT_RANK_BY_ID.get(id.trim().toLowerCase())
+}
+
+/** 候选模型能力表的缓存时长（登录 / 目录刷新后能力会变，不能永久缓存）。 */
+const EFFORT_CACHE_TTL_MS = 5 * 60 * 1000
+
+/** 整组能力并集的缓存时长（同上：账号登录状态变化会改变候选的模型能力）。 */
+const CAPABILITY_CACHE_TTL_MS = 5 * 60 * 1000
+
+/**
+ * 目标候选**声明**的 effort id 列表（`undefined` 表示未知 / 查询失败）。
+ *
+ * 用 `llm.resolveModelInfo`（与 `buildModelCatalog` 同一个入口），因此拿到的
+ * 就是 DSH 校验时会用的那份能力表——两边绝不会各说各话。
+ */
+async function declaredEfforts(llm, parsed, cache, signal) {
+  const key = `${parsed.provider}::${parsed.model}`
+  const now = Date.now()
+  const cached = cache.get(key)
+  if (cached !== undefined && now - cached.at < EFFORT_CACHE_TTL_MS) return cached.meta
+  if (typeof llm?.resolveModelInfo !== 'function') {
+    cache.set(key, { at: now, meta: { ids: undefined, defaultEffort: undefined } })
+    return cache.get(key).meta
+  }
+  let meta
+  try {
+    const info = await llm.resolveModelInfo(parsed.provider, parsed.model, signal)
+    const ids = Array.isArray(info?.reasoning?.efforts)
+      ? info.reasoning.efforts.map(effort => (typeof effort?.id === 'string' ? effort.id : '')).filter(id => id !== '')
+      : []
+    const defaultEffort = typeof info?.reasoning?.defaultEffort === 'string' ? info.reasoning.defaultEffort : undefined
+    meta = { ids, defaultEffort }
+  } catch {
+    // 「候选暂时查不到能力」很常见（没登录 / 目录刚刷新）。不缓存失败：
+    // 下次请求还有机会拿到真实能力，而本次按「未知」处理——见 chooseEffort。
+    return { ids: undefined, defaultEffort: undefined }
+  }
+  cache.set(key, { at: now, meta })
+  return meta
+}
+
+/**
+ * 把会话里的 effort 映射成目标候选能接受的 id。
+ *
+ * @param {string} requested            会话当前保存的 effort id
+ * @param {{ids?: string[], defaultEffort?: string}} meta  目标候选声明的档位
+ * @returns {string|undefined}  目标认识的 id；`undefined` = 目标不支持推理，
+ *                              调用方应把 `reasoningEffort` 去掉（走它的默认）
+ */
+export function chooseEffort(requested, meta) {
+  if (typeof requested !== 'string' || requested === '') return undefined
+  const ids = Array.isArray(meta?.ids) ? meta.ids : []
+  if (ids.length === 0) return undefined
+  if (ids.includes(requested)) return requested
+  const want = effortRank(requested)
+  const ranked = ids.map(id => ({ id, rank: effortRank(id) })).filter(row => row.rank !== undefined)
+  if (want === undefined || ranked.length === 0) {
+    // id 不认识（渠道自定义方言）：退回目标自己的默认档，再不行取第一个。
+    return meta.defaultEffort ?? ids[0]
+  }
+  // 距离最近者优先；同距离优先更低档（宁可少花推理预算，也不要报错）。
+  ranked.sort((a, b) => (Math.abs(a.rank - want) - Math.abs(b.rank - want)) || (a.rank - b.rank))
+  return ranked[0].id
+}
+
 /** 首个 chunk 就是失败终止 → 这个候选什么也没产出，可以换人。 */
 export function isFailureFinish(chunk) {
   return chunk !== null
@@ -160,6 +252,8 @@ export function createRotationAdapter(deps) {
   const exhausted = typeof deps.exhausted === 'function' ? deps.exhausted : () => false
   /** 能力解析缓存：`buildModelCatalog` 每次刷新都会为每个模型查一次，别每次都打上游。 */
   const capabilityCache = new Map()
+  /** 每个候选各自声明的 effort 档位（转发前做档位翻译用，带 TTL）。 */
+  const effortCache = new Map()
 
   function groupOf(model) {
     return groups().find(group => group?.id === model && group?.enabled !== false)
@@ -204,9 +298,22 @@ export function createRotationAdapter(deps) {
       return
     }
     let last
+    const requestedEffort = typeof options?.reasoningEffort === 'string' && options.reasoningEffort !== ''
+      ? options.reasoningEffort
+      : undefined
     for (const member of order) {
       const parsed = parseMember(member)
       const downstream = { ...options, provider: parsed.provider, model: parsed.model }
+      // 档位翻译：会话里存的 effort 来自**组的首选候选**，换到别的候选时它未必认识
+      // （典型：组首是 buddy 的 high，轮到 CodeArts 只有 on/off → DSH 在打上游之前
+      // 就抛 UNSUPPORTED_REASONING_EFFORT）。这里按目标候选的能力表翻译；
+      // 目标不支持推理时直接去掉该字段，让下游走自己的默认。
+      if (requestedEffort !== undefined) {
+        const meta = await declaredEfforts(llm, parsed, effortCache, options?.signal)
+        const adapted = chooseEffort(requestedEffort, meta)
+        if (adapted === undefined) delete downstream.reasoningEffort
+        else if (adapted !== requestedEffort) downstream.reasoningEffort = adapted
+      }
       let produced = false
       try {
         for await (const chunk of llm.stream(downstream)) {
@@ -233,7 +340,7 @@ export function createRotationAdapter(deps) {
 }
 
 /**
- * 把「组里第一个可用候选」的模型能力转述给上层。
+ * 把**整组候选**的模型能力合并后转述给上层。
  *
  * 为什么必须转述：`buildModelCatalog` 会为目录里每个模型调
  * `ctx.llm.resolveModelInfo()`，而 `LlmRuntime.normalizeModelInfo()` 会**校验**
@@ -242,28 +349,88 @@ export function createRotationAdapter(deps) {
  * defaultMaxTokens / inputModalities / systemPromptUpdate / toolUpdate），
  * 任何异常都退化为「没有额外能力」，绝不让目录失败。
  *
- * 为什么要转述而不是写死：轮换的候选通常是同一个模型的不同渠道，推断预算与
- * 推理档位应当与它们一致，否则选择器里会少一档 effort、或者被误判成纯文本。
+ * 为什么是**并集**而不是「第一个候选」：DSH 会在**调用适配器之前**拿这份能力表
+ * 校验会话里保存的 `reasoningEffort`，不匹配就抛 `UNSUPPORTED_REASONING_EFFORT`
+ * （`provider "auth-hub" …`）——这时请求还没走到 `stream()`，转发前的档位翻译
+ * 根本没机会执行。用户把组首从 buddy 改成 codearts 后，会话里存的 `high` 就会
+ * 被路由层直接拒掉。所以这里对 effort 取**所有候选的并集**：只要有一个候选认识
+ * 这个 id，它就继续合法；真正发出时再由 `chooseEffort` 翻译成目标候选的档位。
  */
 async function describeGroup(group, { llm, warn, cache, signal }) {
   const members = Array.isArray(group?.members) ? group.members : []
-  const first = members.map(parseMember).find(parsed => parsed !== undefined && parsed.provider !== ROUTER_PROVIDER)
-  if (first === undefined) return {}
-  const key = `${first.provider}::${first.model}`
+  const parsed = members
+    .map(parseMember)
+    .filter(member => member !== undefined && member.provider !== ROUTER_PROVIDER)
+  if (parsed.length === 0) return {}
+  // 缓存键必须包含**全部成员**：组的成员一变（增删 / 调整顺序），能力并集就变了。
+  const key = `${group?.id ?? ''}::${parsed.map(member => member.id).join('|')}`
+  const now = Date.now()
   const cached = cache.get(key)
-  if (cached !== undefined) return cached
-  let capability = {}
-  try {
-    const info = await llm.resolveModelInfo(first.provider, first.model, signal)
-    capability = sanitizeCapability(info)
-  } catch (error) {
-    // 「第一个候选暂时查不到」很常见（没登录 / 目录刚刷新）。不缓存失败：
-    // 下次刷新还有机会拿到真实能力。
-    warn?.(`auth-hub: 取 ${key} 的模型能力失败（按无额外能力处理）：${error instanceof Error ? error.message : String(error)}`)
-    return {}
+  if (cached !== undefined && now - cached.at < CAPABILITY_CACHE_TTL_MS) return cached.capability
+  const infos = []
+  // 上限只为防呆（组里塞几十个候选时别在启动目录上打几十次上游查询）。
+  for (const member of parsed.slice(0, 8)) {
+    try {
+      infos.push(await llm.resolveModelInfo(member.provider, member.model, signal))
+    } catch (error) {
+      // 「某个候选暂时查不到」很常见（没登录 / 目录刚刷新）——只跳过它，
+      // 其余候选的能力照样合并；一个都拿不到时**不缓存**，下次刷新还有机会。
+      warn?.(`auth-hub: 取 ${member.id} 的模型能力失败（按无额外能力处理）：${error instanceof Error ? error.message : String(error)}`)
+    }
   }
-  cache.set(key, capability)
+  const capability = mergeCapabilities(infos)
+  // 能力会随登录状态 / 远端目录变化（例如账号刚登录后模型才出现），
+  // 所以缓存带 TTL，不做成永久的。
+  if (infos.length > 0) cache.set(key, { at: now, capability })
   return capability
+}
+
+/**
+ * 合并整组候选的能力，得到一份「不会误拒任何已保存配置」的对外声明。
+ *
+ * - 推理档位：**并集**（按候选顺序，id 完全相同的去重）。默认档取第一个
+ *   候选声明且仍在并集里的那个。
+ * - 上下文窗口 / 默认输出上限：取**最小**的已知值，不夸大任何一个候选。
+ * - 输入模态：**并集**。某个候选不吃图时，发过去会由它自己报
+ *   `UNSUPPORTED_CONTENT`，路由再回退下一个候选——不因为组里混进纯文本渠道
+ *   就把整个组的看图能力关掉。
+ * - `systemPromptUpdate` / `toolUpdate`：所有候选一致才透传，否则交给 DSH 默认。
+ */
+function mergeCapabilities(infos) {
+  const caps = infos.map(sanitizeCapability)
+  const out = {}
+  const windows = caps.map(cap => cap.context?.contextWindow).filter(window => Number.isInteger(window) && window > 0)
+  if (windows.length > 0) out.context = { contextWindow: Math.min(...windows) }
+  const maxTokens = caps.map(cap => cap.defaultMaxTokens).filter(value => Number.isSafeInteger(value) && value > 0)
+  if (maxTokens.length > 0) out.defaultMaxTokens = Math.min(...maxTokens)
+  const modalities = []
+  for (const cap of caps) {
+    for (const modality of Array.isArray(cap.inputModalities) ? cap.inputModalities : []) {
+      if (!modalities.includes(modality)) modalities.push(modality)
+    }
+  }
+  if (modalities.length > 0) out.inputModalities = modalities
+  for (const field of ['systemPromptUpdate', 'toolUpdate']) {
+    const values = caps.map(cap => cap[field]).filter(value => typeof value === 'string')
+    if (values.length > 0 && values.every(value => value === values[0])) out[field] = values[0]
+  }
+  const efforts = []
+  const seen = new Set()
+  let defaultEffort
+  for (const cap of caps) {
+    for (const effort of cap.reasoning?.efforts ?? []) {
+      if (seen.has(effort.id)) continue
+      seen.add(effort.id)
+      efforts.push(effort)
+    }
+    if (defaultEffort === undefined && typeof cap.reasoning?.defaultEffort === 'string' && seen.has(cap.reasoning.defaultEffort)) {
+      defaultEffort = cap.reasoning.defaultEffort
+    }
+  }
+  if (efforts.length > 0) {
+    out.reasoning = { efforts, ...defaultEffort === undefined ? {} : { defaultEffort } }
+  }
+  return out
 }
 
 /** 只保留 `normalizeModelInfo` 会校验的字段，并逐项兜住形状。 */

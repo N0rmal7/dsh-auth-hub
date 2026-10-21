@@ -8,11 +8,13 @@
  * 四个分区：
  *   1. 渠道账号 —— 13 个渠道的账号 / 余额 / 签到状态（**折叠状态就显示**），可登录、
  *      领取、续期、停用、删除；可开「自动补签」。
- *   2. 按模型   —— **只看账号渠道**：模型来自 channel-pack 的 `model.list` RPC，
+ *   2. 签到渠道 —— **自己加的**每日签到站点（粘 Cookie / 粘 cURL 即可），自动签到
+ *      并把奖励记进同一个积分台账。
+ *   3. 按模型   —— **只看账号渠道**：模型来自 channel-pack 的 `model.list` RPC，
  *      展开可见它落在哪些渠道、渠道下有哪些账号与余额。
- *   3. 积分上限 —— 每账号渠道每天最多消耗多少**积分**；已用量 = 余额差分，
+ *   4. 积分上限 —— 每账号渠道每天最多消耗多少**积分**；已用量 = 余额差分，
  *      由 Host 半身记到 `credit-usage.json`，channel-pack 的补丁在选号时执行。
- *   4. WorkBuddy —— 国内版 / 国际版。
+ *   5. WorkBuddy —— 国内版 / 国际版。
  *
  * 数据与动作都**不复制**后端逻辑：
  *   - 13 个渠道：宿主 connection 的 RPC `/api/channel-pack`（方法名与它自己的
@@ -68,6 +70,11 @@ window.__ModuleLoader__.load({
     const HUB_POLICY_PATH = '/plugins/dsh-auth-hub/policy'
     const HUB_SAMPLE_PATH = '/plugins/dsh-auth-hub/credit-sample'
     const HUB_ROTATIONS_PATH = '/plugins/dsh-auth-hub/rotations'
+    const HUB_CHECKIN_PATH = '/plugins/dsh-auth-hub/checkin'
+    const HUB_CHECKIN_RUN_PATH = '/plugins/dsh-auth-hub/checkin-run'
+    const HUB_CHECKIN_PARSE_PATH = '/plugins/dsh-auth-hub/checkin-parse'
+    const HUB_CHECKIN_PROBE_PATH = '/plugins/dsh-auth-hub/checkin-probe'
+    const HUB_CHECKIN_IMPORT_PATH = '/plugins/dsh-auth-hub/checkin-import'
     const HUB_CONTROL_KEY_HEADER = 'x-auth-hub-control-key'
     const COMBOS_PATH = '/api/our-free-model/combos'
     /** 渠道账号登录链接的存活窗口（与 channel-pack 一致）。 */
@@ -231,6 +238,16 @@ window.__ModuleLoader__.load({
       fontSize: 13,
     }
     const selectStyle = { ...inputStyle, cursor: 'pointer' }
+    const textareaStyle = {
+      ...inputStyle,
+      padding: '6px 8px',
+      minHeight: 70,
+      width: '100%',
+      fontFamily: 'ui-monospace, SFMono-Regular, Consolas, monospace',
+      fontSize: 12,
+      lineHeight: '18px',
+      resize: 'vertical',
+    }
     const checkboxStyle = { accentColor: 'var(--dsw-alias-brand-primary, #4b8cff)', width: 16, height: 16, flex: 'none' }
     const listBoxStyle = {
       maxHeight: 260,
@@ -359,6 +376,55 @@ window.__ModuleLoader__.load({
         headers: { 'Content-Type': 'application/json', [HUB_CONTROL_KEY_HEADER]: controlKey },
         body: JSON.stringify({ rotations }),
       }), '保存轮换组')
+    }
+
+    /** 签到渠道：`GET` 读（密钥只回掩码），`POST` 写全量。 */
+    async function readCheckin() {
+      return readJsonResponse(await fetch(HUB_CHECKIN_PATH, { headers: { accept: 'application/json' } }), '签到渠道')
+    }
+
+    async function postCheckin(controlKey, payload) {
+      return readJsonResponse(await fetch(HUB_CHECKIN_PATH, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', [HUB_CONTROL_KEY_HEADER]: controlKey },
+        body: JSON.stringify(payload),
+      }), '保存签到渠道')
+    }
+
+    /** 立即签到：`{ ids?, force? }`。 */
+    async function postCheckinRun(controlKey, payload) {
+      return readJsonResponse(await fetch(HUB_CHECKIN_RUN_PATH, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', [HUB_CONTROL_KEY_HEADER]: controlKey },
+        body: JSON.stringify(payload),
+      }), '执行签到')
+    }
+
+    /** 把一条 cURL 拆成草稿。 */
+    async function postCheckinParse(controlKey, curl) {
+      return readJsonResponse(await fetch(HUB_CHECKIN_PARSE_PATH, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', [HUB_CONTROL_KEY_HEADER]: controlKey },
+        body: JSON.stringify({ curl }),
+      }), '解析 cURL')
+    }
+
+    /** 一键识别中转站（New API 系）：填域名即可。 */
+    async function postCheckinProbe(controlKey, payload) {
+      return readJsonResponse(await fetch(HUB_CHECKIN_PROBE_PATH, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', [HUB_CONTROL_KEY_HEADER]: controlKey },
+        body: JSON.stringify(payload),
+      }), '识别中转站')
+    }
+
+    /** 批量生成中转站草稿（不写盘，返回草稿数组交给界面确认）。 */
+    async function postCheckinImport(controlKey, payload) {
+      return readJsonResponse(await fetch(HUB_CHECKIN_IMPORT_PATH, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', [HUB_CONTROL_KEY_HEADER]: controlKey },
+        body: JSON.stringify(payload),
+      }), '批量导入')
     }
     //#endregion
 
@@ -652,6 +718,815 @@ window.__ModuleLoader__.load({
                 ])
               })),
         ]) : null,
+      ])
+    }
+    //#endregion
+
+    //#region 签到渠道：自己加的每日签到站点
+    /**
+     * 「签到渠道」分区。
+     *
+     * 与上面 13 个渠道的本质区别：那些是**内置**的（登录协议写在 pack 里），这些是
+     * **用户自己加的**（一条 HTTP 模板 + 规则）。所以这里提供三种上手方式，按省事
+     * 程度排序：
+     *
+     *   1. 粘贴 cURL（浏览器右键「Copy as cURL」）—— 自动拆出 URL / Cookie / body；
+     *   2. 选模板（New API 系 / Cookie+GET / Bearer+POST / 表单 POST）再填字段；
+     *   3. 从空白开始手填。
+     *
+     * 密钥（Cookie / Authorization）**永远不回显原文**：Host 只给 `headerHints`
+     * 里的掩码。所以表单里这些输入框用占位符提示「已配置 abc…xyz，留空=不改」，
+     * 用户输入新值才覆盖，显式点「清除」才删除。
+     */
+    function CheckinTab(props) {
+      const { controlKey, onError } = props
+      const [view, setView] = useState(undefined)
+      const [busy, setBusy] = useState('')
+      const [notice, setNotice] = useState('')
+      const [error, setError] = useState('')
+      const [curl, setCurl] = useState('')
+      const [draft, setDraft] = useState(null)
+      /** 草稿里被删掉的头（`''` 表示「不覆盖」）。 */
+      const [clearHeaders, setClearHeaders] = useState([])
+      /** 一键识别中转站：域名 + 结果。 */
+      const [probeOrigin, setProbeOrigin] = useState('')
+      const [probeBusy, setProbeBusy] = useState(false)
+      const [probeResult, setProbeResult] = useState(null)
+      /** 批量导入：一行一个域名 + 共用凭据。 */
+      const [bulkOpen, setBulkOpen] = useState(false)
+      const [bulkSites, setBulkSites] = useState('')
+      const [bulkCookie, setBulkCookie] = useState('')
+      const [bulkUser, setBulkUser] = useState('')
+      const [bulkBusy, setBulkBusy] = useState(false)
+      const [bulkResult, setBulkResult] = useState(null)
+
+      const load = useCallback(async () => {
+        try {
+          setView(await readCheckin())
+        } catch (caught) { onError(caught) }
+      }, [onError])
+
+      useEffect(() => { void load() }, [load])
+
+      const templates = Array.isArray(view?.templates) ? view.templates : []
+      /**
+       * 模板的**本地兜底**。
+       *
+       * `view.templates` 来自 Host；当它为空（旧版 Host / 请求还没回来 / 接口出错）时，
+       * 模板按钮区会变成空白——用户看到的是「② 或用模板起步」下面什么都没有，
+       * 点了也没反应。这里留一份最小可用的副本，保证那一栏永远有东西可点。
+       */
+      const TEMPLATE_FALLBACK = [
+        { id: 'newapi', label: 'New API 系站点', hint: 'AI 中转站：签到送额度', draft: { method: 'POST', contentType: 'application/json', body: '{}', headers: { Cookie: '', 'New-Api-User': '' }, success: { jsonPath: 'success', equals: true }, already: { bodyMatches: '已签到|已经签到|already' }, reward: { jsonPath: 'data.quota_awarded' }, rewardUnit: '额度', scheduleAt: '08:30' } },
+        { id: 'cookie-get', label: 'Cookie + GET', hint: '最常见的一类', draft: { method: 'GET', contentType: '', body: '', headers: { Cookie: '' }, success: {}, already: { bodyMatches: '已签到|已经签到|重复签到|already' }, reward: {}, rewardUnit: '积分', scheduleAt: '08:30' } },
+        { id: 'bearer-post', label: 'Bearer + POST', hint: 'Authorization: Bearer <token>', draft: { method: 'POST', contentType: 'application/json', body: '{}', headers: { Authorization: 'Bearer ' }, success: { jsonPath: 'code', equals: 0 }, already: { jsonPath: 'code', equals: 1001 }, reward: { jsonPath: 'data.reward' }, rewardUnit: '积分', scheduleAt: '08:30' } },
+        { id: 'form-post', label: '表单 POST', hint: 'x-www-form-urlencoded', draft: { method: 'POST', contentType: 'application/x-www-form-urlencoded', body: '', headers: { Cookie: '' }, success: {}, already: { bodyMatches: '已签到|already' }, reward: {}, rewardUnit: '积分', scheduleAt: '08:30' } },
+      ]
+      const effectiveTemplates = templates.length > 0 ? templates : TEMPLATE_FALLBACK
+      const channels = Array.isArray(view?.channels) ? view.channels : []
+
+      /**
+       * 空白草稿：以「Cookie + GET」为骨架（最常见、字段最少）。
+       *
+       * 不直接取 `templates[0]`：那是 New API 模板，带一个 `New-Api-User` 头，
+       * 对绝大多数站点是噪音。
+       */
+      const blankDraft = () => {
+        const template = effectiveTemplates.find(row => row.id === 'cookie-get') ?? effectiveTemplates[0] ?? { draft: {} }
+        return {
+          id: 'checkin',
+          label: '',
+          enabled: true,
+          note: '',
+          ...JSON.parse(JSON.stringify(template.draft ?? {})),
+          headers: { ...(template.draft?.headers ?? { Cookie: '' }) },
+          success: {},
+          already: { bodyMatches: '已签到|已经签到|重复签到|already' },
+          reward: {},
+          rewardUnit: '积分',
+          scheduleAt: '08:30',
+        }
+      }
+
+      const startBlank = () => {
+        setDraft(blankDraft())
+        setClearHeaders([])
+        setNotice('填写 URL 与 Cookie；不确定时用「粘贴 cURL」更快')
+      }
+
+      const startTemplate = templateId => {
+        const template = effectiveTemplates.find(row => row.id === templateId)
+        if (template === undefined) return
+        setDraft({
+          id: 'checkin', label: '', enabled: true, note: '',
+          ...JSON.parse(JSON.stringify(template.draft)),
+          // 模板自带的头（含 `Bearer ` 这类前缀提示）必须保留，否则用户不知道该填什么形状。
+          headers: { ...(template.draft?.headers ?? {}) },
+        })
+        setClearHeaders([])
+        setNotice(template.hint)
+      }
+
+      const parseCurlDraft = async () => {
+        setBusy('parse'); setError('')
+        try {
+          if (controlKey === '') throw new Error('拿不到 controlKey（Host 半身未加载）')
+          const payload = await postCheckinParse(controlKey, curl)
+          setDraft({ ...payload.draft, headers: { ...(payload.draft.headers ?? {}) } })
+          setClearHeaders([])
+          setNotice(payload.detected === 'newapi'
+            ? `已识别为 New API 中转站：${payload.draft.url}（判定规则与奖励路径已自动填好）`
+            : `已解析：${payload.draft.method} ${payload.draft.url}${payload.draft.body === '' ? '' : '（含 body）'}`)
+        } catch (caught) { setError(errorText(caught)) } finally { setBusy('') }
+      }
+
+      /**
+       * 一键识别中转站。
+       *
+       * 只需域名：Host 会去探 `/api/status` 认系统、再试两个候选签到端点。
+       * 探到就直接把草稿填进表单（用户可以在保存前改）。
+       */
+      const probeSite = async () => {
+        setProbeBusy(true); setError(''); setProbeResult(null)
+        try {
+          if (controlKey === '') throw new Error('拿不到 controlKey（Host 半身未加载）')
+          const payload = await postCheckinProbe(controlKey, { origin: probeOrigin.trim() })
+          setProbeResult(payload.probe ?? null)
+          if (payload.draft !== undefined) {
+            setDraft({ ...payload.draft, headers: { ...(payload.draft.headers ?? {}) } })
+            setClearHeaders([])
+            setNotice(`识别成功：${payload.draft.url}。填上 Cookie 与用户 ID 后保存即可。`)
+          } else {
+            setNotice('没认出这是 New API 系站点；如果是别家系统，用下面的模板或粘 cURL。')
+          }
+        } catch (caught) { setError(errorText(caught)) } finally { setProbeBusy(false) }
+      }
+
+      /**
+       * 批量导入：生成草稿 → **让用户确认后**才保存。
+       *
+       * 分两步是刻意的：批量导入最怕「一按就把 20 个没验证的渠道写进去」，
+       * 之后每天全失败还得逐个删。所以这里只生成草稿并预览，保存走「确认导入」。
+       */
+      const runBulkImport = async () => {
+        setBulkBusy(true); setError(''); setBulkResult(null)
+        try {
+          if (controlKey === '') throw new Error('拿不到 controlKey（Host 半身未加载）')
+          const payload = await postCheckinImport(controlKey, {
+            sites: bulkSites,
+            cookie: bulkCookie,
+            userId: bulkUser.trim(),
+          })
+          setBulkResult(payload)
+          if (payload.count === 0) setNotice('没解析出任何站点——检查一下格式（一行一个域名）')
+          else setNotice(`解析出 ${payload.count} 个站点，确认无误后点「确认导入」`)
+        } catch (caught) { setError(errorText(caught)) } finally { setBulkBusy(false) }
+      }
+
+      /** 把预览里的草稿真的写进去（与现有渠道合并）。 */
+      const commitBulkImport = async () => {
+        const drafts = Array.isArray(bulkResult?.drafts) ? bulkResult.drafts : []
+        if (drafts.length === 0) return
+        setBulkBusy(true); setError('')
+        try {
+          if (controlKey === '') throw new Error('拿不到 controlKey（Host 半身未加载）')
+          const payload = await postCheckin(controlKey, { channels: [...channels.map(toSubmittedChannel), ...drafts] })
+          setView(payload)
+          setBulkResult(null); setBulkSites(''); setBulkCookie(''); setBulkUser(''); setBulkOpen(false)
+          const problems = Array.isArray(payload.problems) ? payload.problems : []
+          setNotice(`已导入 ${drafts.length} 个站点${problems.length > 0 ? `，${problems.length} 条被丢弃：${problems.join('；')}` : ''}`)
+        } catch (caught) { setError(errorText(caught)) } finally { setBulkBusy(false) }
+      }
+
+      const editChannel = channel => {
+        // 编辑时 `headers` 一律留空：Host 只给掩码，原文拿不回来。留空的语义是
+        // 「保持原值」，所以编辑别的字段不会误删密钥。        const headers = {}
+        for (const name of Array.isArray(channel.headerNames) ? channel.headerNames : []) headers[name] = ''
+        setDraft({
+          id: channel.id,
+          label: channel.label,
+          enabled: channel.enabled !== false,
+          note: channel.note ?? '',
+          method: channel.method,
+          url: channel.url,
+          contentType: channel.contentType ?? '',
+          body: channel.body ?? '',
+          success: channel.success ?? {},
+          already: channel.already ?? {},
+          reward: channel.reward ?? {},
+          rewardUnit: channel.rewardUnit ?? '积分',
+          scheduleAt: channel.scheduleAt ?? '08:30',
+          template: channel.template,
+          headers,
+        })
+        setClearHeaders([])
+        setNotice(`正在编辑「${channel.label}」：密钥留空 = 保持原值`)
+      }
+
+      /** 空白的头值不提交（= 不覆盖）；要删除的头放进 `removeHeaders[]`。 */
+      const commitDraft = async () => {
+        if (draft === null) return
+        setBusy('save'); setError('')
+        try {
+          if (controlKey === '') throw new Error('拿不到 controlKey（Host 半身未加载）')
+          const headers = {}
+          for (const [name, value] of Object.entries(draft.headers ?? {})) {
+            if (typeof value !== 'string') continue
+            const trimmed = value.trim()
+            if (trimmed === '') continue
+            // 模板里的 `Bearer ` 只是个「该填 token」的提示，用户没填就被当成真值
+            // 发出去会得到 401，而不是「未配置」这种能看懂的提示。
+            if (/^(bearer|basic|token)$/i.test(trimmed)) continue
+            headers[name] = trimmed
+          }
+          const row = {
+            id: draft.id,
+            label: draft.label === '' ? draft.id : draft.label,
+            enabled: draft.enabled !== false,
+            note: draft.note ?? '',
+            method: draft.method,
+            url: draft.url,
+            contentType: draft.contentType ?? '',
+            body: draft.body ?? '',
+            success: draft.success ?? {},
+            already: draft.already ?? {},
+            reward: draft.reward ?? {},
+            rewardUnit: draft.rewardUnit ?? '积分',
+            scheduleAt: draft.scheduleAt ?? '08:30',
+            template: draft.template,
+            headers,
+            removeHeaders: clearHeaders,
+          }
+          const existing = channels.filter(channel => channel.id !== row.id).map(toSubmittedChannel)
+          const payload = await postCheckin(controlKey, { channels: [...existing, row] })
+          setView(payload)
+          setDraft(null); setClearHeaders([]); setCurl('')
+          const problems = Array.isArray(payload.problems) ? payload.problems : []
+          setNotice(problems.length > 0
+            ? `已保存，但有 ${problems.length} 条被丢弃：${problems.join('；')}`
+            : `已保存「${row.label}」`)
+        } catch (caught) { setError(errorText(caught)) } finally { setBusy('') }
+      }
+
+      /**
+       * 回写时把界面视角的字段还原成 Host 期望的形状。
+       *
+       * 密钥一律**不传**（`headers: {}`）：界面只知道掩码，传空串没有意义，而
+       * Host 的语义是「没提到的头保持原值」。批量操作（启停 / 删除）因此不会
+       * 误伤任何密钥——这正是把它写成空对象而不是空串的原因。
+       */
+      const toSubmittedChannel = channel => ({
+        id: channel.id,
+        label: channel.label,
+        enabled: channel.enabled !== false,
+        note: channel.note ?? '',
+        method: channel.method,
+        url: channel.url,
+        contentType: channel.contentType ?? '',
+        body: channel.body ?? '',
+        success: channel.success ?? {},
+        already: channel.already ?? {},
+        reward: channel.reward ?? {},
+        rewardUnit: channel.rewardUnit ?? '积分',
+        scheduleAt: channel.scheduleAt ?? '08:30',
+        template: channel.template,
+        headers: {},
+      })
+
+      const saveChannels = async (rows, message) => {
+        setBusy('save'); setError('')
+        try {
+          if (controlKey === '') throw new Error('拿不到 controlKey（Host 半身未加载）')
+          const payload = await postCheckin(controlKey, { channels: rows })
+          setView(payload)
+          if (message !== undefined) setNotice(message)
+        } catch (caught) { setError(errorText(caught)) } finally { setBusy('') }
+      }
+
+      const removeChannel = channel => saveChannels(channels.filter(row => row.id !== channel.id).map(toSubmittedChannel), `已删除「${channel.label}」`)
+
+      const toggleChannel = channel => saveChannels(
+        channels.map(row => row.id === channel.id ? { ...toSubmittedChannel(row), enabled: row.enabled === false } : toSubmittedChannel(row)),
+        channel.enabled === false ? `已启用「${channel.label}」` : `已停用「${channel.label}」`,
+      )
+
+      const saveSettings = async patch => {
+        setBusy('settings'); setError('')
+        try {
+          if (controlKey === '') throw new Error('拿不到 controlKey（Host 半身未加载）')
+          const payload = await postCheckin(controlKey, { channels: channels.map(toSubmittedChannel), settings: { ...view?.settings, ...patch } })
+          setView(payload)
+          setNotice('设置已保存')
+        } catch (caught) { setError(errorText(caught)) } finally { setBusy('') }
+      }
+
+      const runNow = async (ids, force) => {
+        setBusy('run'); setError('')
+        try {
+          if (controlKey === '') throw new Error('拿不到 controlKey（Host 半身未加载）')
+          const payload = await postCheckinRun(controlKey, { ...(ids === undefined ? {} : { ids }), force: force === true })
+          setView(payload)
+          const results = Array.isArray(payload.results) ? payload.results : []
+          if (results.length === 0) { setNotice('没有到点或待签的渠道'); return }
+          const okRows = results.filter(row => row.ok === true && row.alreadyDone !== true)
+          const alreadyRows = results.filter(row => row.alreadyDone === true)
+          const badRows = results.filter(row => row.ok !== true)
+          const parts = []
+          if (okRows.length > 0) parts.push(`${okRows.length} 个签到成功${okRows.some(row => row.reward > 0) ? `（+${okRows.reduce((sum, row) => sum + (Number(row.reward) || 0), 0)}）` : ''}`)
+          if (alreadyRows.length > 0) parts.push(`${alreadyRows.length} 个今天已签`)
+          if (badRows.length > 0) parts.push(`${badRows.length} 个失败：${badRows.slice(0, 2).map(row => `${row.label}（${row.message}）`).join('；')}`)
+          setNotice(parts.join('，'))
+        } catch (caught) { setError(errorText(caught)) } finally { setBusy('') }
+      }
+
+      const testOne = async channel => {
+        setBusy(`test:${channel.id}`); setError('')
+        try {
+          // 「测试」= force 跑一条：不写状态（Host 侧照常记状态，但已签的重跑
+          // 只会得到「已签到」，不会重复记奖励）。
+          const payload = await postCheckinRun(controlKey, { ids: [channel.id], force: true })
+          const row = Array.isArray(payload.results) ? payload.results[0] : undefined
+          setView(payload)
+          setNotice(row === undefined ? '没有执行' : `${channel.label}：${row.ok === true ? (row.alreadyDone === true ? '今天已签' : '签到成功') : `失败——${row.message}`}`)
+        } catch (caught) { setError(errorText(caught)) } finally { setBusy('') }
+      }
+
+      const headerNames = draft === null ? [] : Array.from(new Set([
+        ...Object.keys(draft.headers ?? {}),
+      ]))
+      const settings = view?.settings ?? { auto: true, at: '08:30', catchUpOnStart: true }
+      const todaySigned = channels.filter(channel => channel.state?.lastDay === view?.day && channel.state?.lastStatus !== 'error').length
+      const dueCount = channels.filter(channel => channel.enabled !== false && channel.state?.lastDay !== view?.day).length
+
+      return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } }, [
+        // ── 概览与全局动作 ────────────────────────────────────────────────
+        h('div', { key: 'bar', style: toolbarStyle }, [
+          h(ActionButton, { key: 'template', small: true, onClick: startBlank }, '+ 添加签到渠道'),
+          h(ActionButton, {
+            key: 'probe',
+            small: true,
+            onClick: () => {
+              // 「白嫖」入口：先把表单开起来，让用户直接在 ⓪ 那一栏填域名。
+              setDraft(blankDraft())
+              setClearHeaders([])
+              setNotice('在表单最上面的「一键识别中转站」里填域名即可；也可以粘 cURL 或选模板。')
+            },
+          }, '⚡ 一键加中转站'),
+          h(ActionButton, {
+            key: 'bulk',
+            small: true,
+            onClick: () => setBulkOpen(value => !value),
+          }, bulkOpen ? '收起批量导入' : '⇥ 批量加中转站'),
+          h(ActionButton, {
+            key: 'run',
+            small: true,
+            disabled: busy === 'run' || channels.length === 0,
+            onClick: () => runNow(undefined, false),
+          }, busy === 'run' ? '签到中…' : '签到到点的渠道'),
+          h(ActionButton, {
+            key: 'runall',
+            small: true,
+            disabled: busy === 'run' || channels.length === 0,
+            onClick: () => runNow(channels.map(channel => channel.id), true),
+          }, '全部重签（含已签）'),
+          h('span', { key: 'spacer', style: spacerStyle }),
+          h(ActionButton, { key: 'reload', small: true, onClick: () => { void load() } }, '重读'),
+        ]),
+        h('div', { key: 'summary', style: accountMetaStyle },
+          `今天（${view?.day ?? '—'}，UTC+8 ${view?.clock ?? '—'}）：${channels.length} 个渠道，${todaySigned} 个已签，${dueCount} 个待签`
+          + ` · 自动签到${settings.auto === true ? `开（${settings.at} 后逐个执行）` : '关'}`),
+        error !== '' ? h('div', { key: 'err', style: errorStyle }, error) : null,
+        notice !== '' ? h('div', { key: 'notice', style: bodyStyle }, notice) : null,
+
+        // ── 批量导入中转站 ────────────────────────────────────────────────
+        bulkOpen
+          ? h('div', { key: 'bulk', style: { ...accountItemStyle, padding: 12, gap: 10 } }, [
+            h('div', { key: 't', style: sectionTitleStyle }, '批量加中转站（New API 系）'),
+            h('div', { key: 'h', style: accountMetaStyle },
+              '一行一个域名，例如 api.example.com。可写成「域名,用户ID」给单独指定用户 ID。'
+              + '同一批共用下面这份 Cookie（不同站要不同 Cookie 就分几批导入）。'),
+            h('textarea', {
+              key: 'sites',
+              style: { ...textareaStyle, minHeight: 90 },
+              placeholder: 'api.example.com\napi.other.com,12345\n# 井号开头是注释',
+              value: bulkSites,
+              onChange: event => setBulkSites(event.target.value),
+            }),
+            h('div', { key: 'row', style: { display: 'flex', gap: 8, flexWrap: 'wrap' } }, [
+              h('input', {
+                key: 'cookie',
+                style: { ...inputStyle, flex: '1 1 260px' },
+                type: 'password',
+                placeholder: 'Cookie（可选，填了就会应用到每个站点）',
+                value: bulkCookie,
+                onChange: event => setBulkCookie(event.target.value),
+              }),
+              h('input', {
+                key: 'uid',
+                style: { ...inputStyle, width: 150 },
+                placeholder: '默认用户 ID',
+                title: 'New-Api-User 头；2 位以上数字才认',
+                value: bulkUser,
+                onChange: event => setBulkUser(event.target.value),
+              }),
+            ]),
+            h('div', { key: 'actions', style: toolbarStyle }, [
+              h(ActionButton, { key: 'parse', small: true, disabled: bulkBusy || bulkSites.trim() === '', onClick: () => { void runBulkImport() } },
+                bulkBusy ? '解析中…' : '解析预览'),
+              h(ActionButton, {
+                key: 'commit',
+                disabled: bulkBusy || (bulkResult?.count ?? 0) === 0,
+                onClick: () => { void commitBulkImport() },
+              }, `确认导入${bulkResult?.count > 0 ? `（${bulkResult.count}）` : ''}`),
+              h('span', { key: 'spacer', style: spacerStyle }),
+              h('span', { key: 'tip', style: accountMetaStyle }, bulkResult === null ? '先解析、看一遍、再导入' : `解析出 ${bulkResult.count} 条`),
+            ]),
+            Array.isArray(bulkResult?.drafts) && bulkResult.drafts.length > 0
+              ? h('div', { key: 'preview', style: { ...listBoxStyle, maxHeight: 180 } },
+                bulkResult.drafts.map(draft => h('div', { key: draft.id, style: { ...listRowStyle, justifyContent: 'space-between' } }, [
+                  h('span', { key: 'a', style: { fontSize: 12, color: 'var(--dsw-alias-label-secondary)' } }, draft.label),
+                  h('span', { key: 'b', style: accountMetaStyle },
+                    [draft.url.replace(/^https?:\/\//, ''),
+                     draft.note === '' ? '' : '⚠ ' + draft.note].filter(Boolean).join(' · ')),
+                ])))
+              : null,
+            Array.isArray(bulkResult?.problems) && bulkResult.problems.length > 0
+              ? h('div', { key: 'probs', style: { display: 'flex', flexDirection: 'column', gap: 2 } },
+                bulkResult.problems.map(row => h('span', {
+                  key: row.line,
+                  style: { ...accountMetaStyle, color: 'var(--dsw-alias-state-warn-primary, #d19100)' },
+                }, `第 ${row.line} 行（${row.text}）：${row.problem}`)))
+              : null,
+            h('div', { key: 'warn', style: accountMetaStyle },
+              '导入后这些站点会一起参与自动签到。若某个站开了 Cloudflare Turnstile，它每天都会显示「今日失败」——那是人机校验拦住了纯协议请求，不是配置错了。'),
+          ])
+          : null,
+
+        // ── 自动签到设置 ──────────────────────────────────────────────────
+        h('div', { key: 'settings', style: { ...accountItemStyle, flexDirection: 'row', flexWrap: 'wrap', alignItems: 'center', gap: 12 } }, [
+          h('span', { key: 't', style: { fontSize: 13, color: 'var(--dsw-alias-label-primary)' } }, '自动签到'),
+          h('label', { key: 'auto', style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 } }, [
+            h('input', {
+              key: 'cb',
+              type: 'checkbox',
+              style: checkboxStyle,
+              checked: settings.auto === true,
+              onChange: event => { void saveSettings({ auto: event.target.checked }) },
+            }),
+            h('span', { key: 'l' }, '每天自动跑'),
+          ]),
+          h('label', { key: 'catchup', style: { display: 'flex', alignItems: 'center', gap: 6, fontSize: 13 } }, [
+            h('input', {
+              key: 'cb',
+              type: 'checkbox',
+              style: checkboxStyle,
+              checked: settings.catchUpOnStart === true,
+              onChange: event => { void saveSettings({ catchUpOnStart: event.target.checked }) },
+            }),
+            h('span', { key: 'l' }, '开机补签'),
+          ]),
+          h('span', { key: 'at', style: accountMetaStyle }, '默认时间'),
+          h('input', {
+            key: 'time',
+            type: 'time',
+            style: { ...inputStyle, width: 110 },
+            value: settings.at ?? '08:30',
+            onChange: event => { void saveSettings({ at: event.target.value }) },
+          }),
+          h('span', { key: 'retry', style: accountMetaStyle }, '失败重试'),
+          h('input', {
+            key: 'retryMin',
+            type: 'number',
+            min: 0,
+            step: 5,
+            style: { ...inputStyle, width: 78 },
+            title: '失败后隔多少分钟再试；0 = 当天不再重试',
+            value: settings.retryMinutes ?? 30,
+            onChange: event => { void saveSettings({ retryMinutes: Number(event.target.value) }) },
+          }),
+          h('span', { key: 'retryU', style: accountMetaStyle }, '分钟一次，每天最多'),
+          h('input', {
+            key: 'maxAttempts',
+            type: 'number',
+            min: 1,
+            max: 10,
+            step: 1,
+            style: { ...inputStyle, width: 62 },
+            title: '每个渠道每天最多执行几次（含首次）',
+            value: settings.maxAttemptsPerDay ?? 3,
+            onChange: event => { void saveSettings({ maxAttemptsPerDay: Number(event.target.value) }) },
+          }),
+          h('span', { key: 'retryU2', style: accountMetaStyle }, '次'),
+          h('span', { key: 'hint', style: accountMetaStyle },
+            '每个渠道还可以各自设定时间（下面的「签到时间」）。到点后逐个执行，签过就跳过；'
+            + '失败会按上面的间隔重试——网络抖动是签到失败最常见的原因，不重试等于抖一次丢一天。'),
+        ]),
+
+        // ── 添加 / 编辑表单 ───────────────────────────────────────────────
+        draft !== null ? h('div', { key: 'draft', style: { ...accountItemStyle, padding: 12, gap: 10 } }, [
+          h('div', { key: 't1', style: sectionTitleStyle }, `新渠道：${draft.label === '' ? draft.id : draft.label}`),
+
+          // ⓪ 一键识别：白嫖主力（New API 系中转站）最快的路径。
+          h('div', { key: 'probe', style: { display: 'flex', flexDirection: 'column', gap: 6, padding: 10, border: '1px solid var(--dsw-alias-border-l2)', borderRadius: 8, background: 'var(--dsw-alias-bg-layer-2, rgba(0,0,0,0.03))' } }, [
+            h('span', { key: 'l', style: { fontSize: 13, color: 'var(--dsw-alias-label-primary)' } },
+              '⓪ 一键识别中转站（New API / One API 系，签到送额度）'),
+            h('span', { key: 'h', style: accountMetaStyle },
+              '只要域名。插件会去探 /api/status 认系统、再试 /api/user/checkin 与 /api/user/sign_in，自动填好端点与判定规则。'),
+            h('div', { key: 'row', style: { display: 'flex', gap: 6, flexWrap: 'wrap' } }, [
+              h('input', {
+                key: 'origin',
+                style: { ...inputStyle, flex: '1 1 240px' },
+                placeholder: '站点域名（例如 api.example.com）',
+                value: probeOrigin,
+                onChange: event => setProbeOrigin(event.target.value),
+                onKeyDown: event => { if (event.key === 'Enter' && !probeBusy) void probeSite() },
+              }),
+              h(ActionButton, { key: 'go', small: true, disabled: probeBusy || probeOrigin.trim() === '', onClick: () => { void probeSite() } },
+                probeBusy ? '探测中…' : '识别'),
+            ]),
+            h('span', { key: 'warn', style: { ...accountMetaStyle, color: 'var(--dsw-alias-state-warn-primary, #d19100)' } },
+              '⚠️ 识别过程会真的发一次签到请求，可能把今天的额度用掉（New API 只有签到接口能区分「成功」和「今日已签」）。不想这样就走下面的 cURL 方式。'),
+            probeResult !== null
+              ? h('div', { key: 'res', style: { display: 'flex', flexDirection: 'column', gap: 2, fontSize: 12 } }, [
+                h('span', { key: 'a', style: { color: probeResult.isNewApi ? 'var(--dsw-alias-state-success-primary, #22a06b)' : 'var(--dsw-alias-state-warn-primary, #d19100)' } },
+                  (probeResult.isNewApi ? '✓ 是 New API 系站点' : '✗ 没认出是 New API 系站点')
+                  + (probeResult.siteName ? `（${probeResult.siteName}）` : '')),
+                h('span', { key: 'b', style: accountMetaStyle },
+                  [probeResult.signPath ? `签到端点：${probeResult.signPath}` : '',
+                   probeResult.reward !== undefined ? `奖励：${probeResult.reward}` : '',
+                   probeResult.alreadyDone === true ? '（今天已签过）' : '',
+                   probeResult.needsTurnstile === true ? '（有人机校验，纯协议签到会被拦）' : '',
+                   probeResult.message].filter(Boolean).join(' · ')),
+              ])
+              : null,
+          ]),
+
+          // 三种上手方式。cURL 一栏放在最上面，因为它是绝大多数人的最优路径。
+          h('div', { key: 'curl', style: { display: 'flex', flexDirection: 'column', gap: 6 } }, [
+            h('span', { key: 'l', style: accountMetaStyle },
+              '① 最快：浏览器 F12 → Network → 右键签到请求 → Copy → Copy as cURL，粘到下面点「解析」'),
+            h('textarea', {
+              key: 'ta',
+              style: textareaStyle,
+              placeholder: "curl 'https://example.com/api/user/checkin' -H 'Cookie: session=...' --data-raw '{}'",
+              value: curl,
+              onChange: event => setCurl(event.target.value),
+            }),
+            h('div', { key: 'row', style: toolbarStyle }, [
+              h(ActionButton, { key: 'parse', small: true, disabled: busy === 'parse' || curl.trim() === '', onClick: parseCurlDraft },
+                busy === 'parse' ? '解析中…' : '解析并填入下面的表单'),
+            ]),
+          ]),
+
+          h('div', { key: 'tpl', style: { display: 'flex', flexDirection: 'column', gap: 6 } }, [
+            h('span', { key: 'l', style: accountMetaStyle }, '② 或用模板起步'),
+            h('div', { key: 'row', style: { display: 'flex', gap: 6, flexWrap: 'wrap' } },
+              effectiveTemplates.map(template => h(ActionButton, {
+                key: template.id,
+                small: true,
+                onClick: () => startTemplate(template.id),
+                title: template.hint,
+              }, template.label))),
+          ]),
+
+          h('div', { key: 'f1', style: { display: 'flex', gap: 8, flexWrap: 'wrap' } }, [
+            h('input', {
+              key: 'label',
+              style: { ...inputStyle, flex: '1 1 160px' },
+              placeholder: '名称（例如 某某中转站）',
+              value: draft.label,
+              onChange: event => setDraft(current => ({ ...current, label: event.target.value })),
+            }),
+            h('input', {
+              key: 'id',
+              style: { ...inputStyle, flex: '0 1 140px' },
+              placeholder: 'id（小写字母数字-）',
+              value: draft.id,
+              title: '稳定 id，用于台账与状态文件，保存后不建议改',
+              onChange: event => setDraft(current => ({ ...current, id: event.target.value })),
+            }),
+            h('select', {
+              key: 'method',
+              style: selectStyle,
+              value: draft.method ?? 'POST',
+              onChange: event => setDraft(current => ({ ...current, method: event.target.value })),
+            }, ['GET', 'POST', 'PUT', 'PATCH'].map(method => h('option', { key: method, value: method }, method))),
+            h('input', {
+              key: 'time',
+              type: 'time',
+              style: { ...inputStyle, width: 110 },
+              title: '该渠道的签到时间（UTC+8）',
+              value: draft.scheduleAt ?? '08:30',
+              onChange: event => setDraft(current => ({ ...current, scheduleAt: event.target.value })),
+            }),
+          ]),
+          h('input', {
+            key: 'url',
+            style: inputStyle,
+            placeholder: '签到接口 URL（https://…）',
+            value: draft.url ?? '',
+            onChange: event => setDraft(current => ({ ...current, url: event.target.value })),
+          }),
+          h('div', { key: 'f2', style: { display: 'flex', gap: 8, flexWrap: 'wrap' } }, [
+            h('input', {
+              key: 'ct',
+              style: { ...inputStyle, flex: '1 1 220px' },
+              placeholder: 'Content-Type（application/json / x-www-form-urlencoded）',
+              value: draft.contentType ?? '',
+              onChange: event => setDraft(current => ({ ...current, contentType: event.target.value })),
+            }),
+          ]),
+          (draft.method === 'GET' ? null : h('textarea', {
+            key: 'body',
+            style: textareaStyle,
+            placeholder: '请求体（POST 用；空着也行，很多签到接口不需要 body）',
+            value: draft.body ?? '',
+            onChange: event => setDraft(current => ({ ...current, body: event.target.value })),
+          })),
+
+          // 密钥区：已存在的渠道只显示掩码，留空 = 不改。
+          h('div', { key: 'headers', style: { display: 'flex', flexDirection: 'column', gap: 6 } }, [
+            h('span', { key: 'l', style: accountMetaStyle },
+              '③ 请求头 / 密钥（Cookie、Authorization…）。已配置的值只显示掩码：留空 = 保持原值，点「清除」才会删除。'),
+            ...headerNames.map(name => h('div', { key: name, style: { display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' } }, [
+              h('span', { key: 'n', style: { ...accountMetaStyle, width: 130 } }, name),
+              h('input', {
+                key: 'v',
+                style: { ...inputStyle, flex: '1 1 240px' },
+                type: name.toLowerCase().includes('cookie') || name.toLowerCase().includes('authorization') ? 'password' : 'text',
+                placeholder: clearHeaders.includes(name)
+                  ? '保存后将删除'
+                  : (draft.headers?.[name] !== '' ? '输入新值' : '留空 = 保持原值'),
+                value: draft.headers?.[name] ?? '',
+                onChange: event => setDraft(current => ({ ...current, headers: { ...current.headers, [name]: event.target.value } })),
+              }),
+              h(ActionButton, {
+                key: 'del',
+                small: true,
+                onClick: () => setClearHeaders(current => current.includes(name) ? current.filter(row => row !== name) : [...current, name]),
+              }, clearHeaders.includes(name) ? '取消清除' : '清除'),
+            ])),
+            h('div', { key: 'add', style: { display: 'flex', gap: 6, flexWrap: 'wrap' } }, [
+              ...['Cookie', 'Authorization', 'Referer', 'X-CSRF-Token'].filter(name => !headerNames.includes(name)).map(name =>
+                h(ActionButton, {
+                  key: name,
+                  small: true,
+                  onClick: () => setDraft(current => ({ ...current, headers: { ...current.headers, [name]: '' } })),
+                }, `+ ${name}`)),
+              h(ActionButton, {
+                key: 'other',
+                small: true,
+                onClick: () => {
+                  const name = window.prompt('头名称（例如 New-Api-User）')
+                  if (typeof name !== 'string' || name.trim() === '') return
+                  setDraft(current => ({ ...current, headers: { ...current.headers, [name.trim()]: '' } }))
+                },
+              }, '+ 其它头'),
+            ]),
+          ]),
+
+          // 判定规则：默认已经够用，进阶才需要改。
+          h('details', { key: 'rules', style: { fontSize: 13 } }, [
+            h('summary', { key: 's', style: { cursor: 'pointer', color: 'var(--dsw-alias-label-secondary)' } },
+              '判定规则（进阶：怎么算成功 / 怎么算已签 / 从哪儿抠奖励）'),
+            h('div', { key: 'rows', style: { display: 'flex', flexDirection: 'column', gap: 8, paddingTop: 8 } }, [
+              h('span', { key: 'h', style: accountMetaStyle },
+                '先判「已签到」再判「成功」——多数站点重复签到时也返回 200，顺序反了会把「已签」记成「签到成功」并重复记奖励。'),
+              ...['success', 'already', 'reward'].map(kind => h('div', { key: kind, style: { display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' } }, [
+                h('span', { key: 'n', style: { ...accountMetaStyle, width: 130 } },
+                  kind === 'success' ? '成功' : kind === 'already' ? '已签到' : '奖励'),
+                h('input', {
+                  key: 'path',
+                  style: { ...inputStyle, flex: '1 1 180px' },
+                  placeholder: 'JSON 路径（例如 success / data.quota）',
+                  title: '按 JSON 字段判定；留空则用下面的正则',
+                  value: draft[kind]?.jsonPath ?? '',
+                  onChange: event => setDraft(current => ({ ...current, [kind]: { ...current[kind], jsonPath: event.target.value } })),
+                }),
+                h('input', {
+                  key: 'eq',
+                  style: { ...inputStyle, width: 110 },
+                  placeholder: '等于',
+                  title: '该字段要等于什么；留空 = 「字段存在即算」',
+                  value: draft[kind]?.equals ?? '',
+                  onChange: event => setDraft(current => ({ ...current, [kind]: { ...current[kind], equals: event.target.value === '' ? undefined : event.target.value } })),
+                }),
+                h('input', {
+                  key: 're',
+                  style: { ...inputStyle, flex: '1 1 180px' },
+                  placeholder: '或正则（例如 已签到|already）',
+                  title: '对响应原文做正则匹配；奖励规则里用捕获组 1 取数额',
+                  value: draft[kind]?.bodyMatches ?? '',
+                  onChange: event => setDraft(current => ({ ...current, [kind]: { ...current[kind], bodyMatches: event.target.value } })),
+                }),
+              ])),
+              h('div', { key: 'unit', style: { display: 'flex', gap: 6, alignItems: 'center' } }, [
+                h('span', { key: 'n', style: { ...accountMetaStyle, width: 130 } }, '奖励单位'),
+                h('input', {
+                  key: 'u',
+                  style: { ...inputStyle, width: 120 },
+                  value: draft.rewardUnit ?? '积分',
+                  onChange: event => setDraft(current => ({ ...current, rewardUnit: event.target.value })),
+                }),
+              ]),
+            ]),
+          ]),
+
+          h('div', { key: 'actions', style: toolbarStyle }, [
+            h(ActionButton, { key: 'save', disabled: busy === 'save' || (draft.url ?? '') === '', onClick: commitDraft },
+              busy === 'save' ? '保存中…' : '保存渠道'),
+            h(ActionButton, { key: 'cancel', small: true, onClick: () => { setDraft(null); setCurl(''); setClearHeaders([]) } }, '取消'),
+            h('span', { key: 'spacer', style: spacerStyle }),
+            h('span', { key: 'tip', style: accountMetaStyle }, '保存后可用「立即签一次」验证规则是否正确'),
+          ]),
+        ]) : null,
+
+        // ── 渠道列表 ──────────────────────────────────────────────────────
+        channels.length === 0
+          ? h('div', { key: 'empty', style: { ...accountMetaStyle, paddingTop: 8 } },
+            '还没有签到渠道。点「+ 添加签到渠道」：从模板起步、粘一条 cURL，或直接填表。')
+          : h('div', { key: 'list', style: { display: 'flex', flexDirection: 'column', gap: 8 } }, channels.map(channel => {
+            const state = channel.state ?? {}
+            const advice = channel.advice ?? null
+            const signedToday = state.lastDay === view?.day
+            const chips = [
+              { text: channel.enabled === false ? '已停用' : (signedToday ? (state.lastStatus === 'error' ? '今日失败' : '今日已签') : '今日待签'), tone: channel.enabled === false ? 'muted' : (signedToday ? (state.lastStatus === 'error' ? 'warn' : 'ok') : 'warn') },
+            ]
+            // 失败时把「第几次尝试」亮出来：重试在后台发生，用户得知道它确实在跑、
+            // 以及为什么到点没签上（答：正在第 2/3 次尝试，上次是 X 分钟前）。
+            if (signedToday && state.lastStatus === 'error') {
+              const attempts = Number(state.attempts) || 0
+              const maxAttempts = Number(settings.maxAttemptsPerDay) || 3
+              const waitMin = Math.max(0, Math.ceil(((Number(settings.retryMinutes) || 30) * 60_000 - (Date.now() - (Number(state.lastRunAt) || 0))) / 60_000))
+              chips.push({
+                text: attempts >= maxAttempts
+                  ? `今日 ${attempts} 次均失败（已达上限）`
+                  : `第 ${attempts}/${maxAttempts} 次失败 · ${waitMin} 分钟后重试`,
+                tone: 'warn',
+              })
+            }
+            if (channel.hasSecrets !== true) chips.push({ text: '未配置 Cookie/Token', tone: 'muted' })
+            if (state.streak > 0) chips.push({ text: `连签 ${state.streak} 天`, tone: 'muted' })
+            if (state.totalReward > 0) chips.push({ text: `累计 ${state.totalReward} ${channel.rewardUnit}`, tone: 'ok' })
+            if (advice?.weekReward > 0) chips.push({ text: `近 7 天 +${advice.weekReward}`, tone: 'ok' })
+            // 最近 14 天的签到格子：一眼看出「这个站到底稳不稳」。
+            // 只用颜色，不写文字——状态栏已经说清今天怎样了，格子是看趋势的。
+            const history = Array.isArray(state.history) ? state.history : []
+            const cells = history.slice(-14)
+            return h('div', { key: channel.id, style: { ...accountItemStyle, ...(draft !== null && draft.id === channel.id ? accountItemSelectedStyle : {}) } }, [
+              h('div', { key: 'row', style: accountRowStyle }, [
+                h('span', { key: 'text', style: accountTextStyle }, [
+                  h('span', { key: 'name', style: { fontSize: 14, color: 'var(--dsw-alias-label-primary)' } }, channel.label),
+                  h('span', { key: 'url', style: { ...accountMetaStyle, wordBreak: 'break-all' } }, `${channel.method} ${channel.url}`),
+                  h(MetaLine, { key: 'meta' }, [
+                    `每天 ${channel.scheduleAt}`,
+                    channel.headerNames.length === 0 ? '' : ` · ${channel.headerNames.map(name => `${name}: ${channel.headerHints?.[name] ?? ''}`).join(' · ')}`,
+                    state.lastRunAt ? ` · 上次 ${formatTime(state.lastRunAt)}` : '',
+                    state.lastMessage ? ` · ${state.lastMessage}` : '',
+                  ].join('')),
+                  cells.length > 0
+                    ? h('span', {
+                      key: 'hist',
+                      title: cells.map(row => `${row.day} ${row.status === 'ok' ? '签到成功' : row.status === 'already' ? '已签' : '失败'}${row.reward > 0 ? ` +${row.reward}` : ''}`).join('\n'),
+                      style: { display: 'flex', gap: 3, flexWrap: 'wrap', marginTop: 2 },
+                    }, cells.map(row => h('span', {
+                      key: row.day,
+                      style: {
+                        width: 10,
+                        height: 10,
+                        borderRadius: 2,
+                        background: row.status === 'ok' ? 'var(--dsw-alias-state-success-primary, #22a06b)'
+                          : row.status === 'already' ? 'var(--dsw-alias-state-success-subtle, rgba(34,160,107,0.35))'
+                            : 'var(--dsw-alias-state-error-primary, #d93f3f)',
+                      },
+                    })))
+                    : null,
+                  // 连续失败比单次失败重要得多：Cookie 过期是常态，而偶发一次谁都可能。
+                  advice !== null && advice.level !== 'ok' && advice.level !== 'muted'
+                    ? h('span', { key: 'advice', style: { ...accountMetaStyle, color: advice.level === 'error' ? 'var(--dsw-alias-state-error-primary)' : 'var(--dsw-alias-state-warn-primary, #d19100)' } }, advice.text)
+                    : null,
+                ]),
+                h('span', { key: 'chips', style: { display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap' } },
+                  chips.map((chip, index) => h(Chip, { key: index, tone: chip.tone }, chip.text))),
+              ]),
+              h('div', { key: 'actions', style: accountActionsStyle }, [
+                h(ActionButton, { key: 'test', small: true, disabled: busy === `test:${channel.id}`, onClick: () => { void testOne(channel) } },
+                  busy === `test:${channel.id}` ? '执行中…' : '立即签一次'),
+                h(ActionButton, { key: 'edit', small: true, onClick: () => editChannel(channel) }, '编辑'),
+                h(ActionButton, { key: 'toggle', small: true, disabled: busy === 'save', onClick: () => { void toggleChannel(channel) } },
+                  channel.enabled === false ? '启用' : '停用'),
+                h(ActionButton, { key: 'del', small: true, disabled: busy === 'save', onClick: () => { void removeChannel(channel) } }, '删除'),
+              ]),
+            ])
+          })),
+
+        // ── 口径与边界 ────────────────────────────────────────────────────
+        h('div', { key: 'notes', style: { ...accountMetaStyle, display: 'flex', flexDirection: 'column', gap: 4, paddingTop: 6 } }, [
+          h('span', { key: 'a' }, `签到奖励会记进积分台账（grants），所以「领了又用掉」不会被算成 0 消耗。台账：${view?.files?.state ?? ''}`),
+          h('span', { key: 'b' }, '这些渠道只负责领额度，不提供模型，所以不会出现在「按模型 / 轮换」里。'),
+          h('span', { key: 'c' }, `失败会按上面的「失败重试」设置重试：间隔 ${settings.retryMinutes ?? 30} 分钟、每天最多 ${settings.maxAttemptsPerDay ?? 3} 次。重试是刻意的——签到失败最常见的原因是网络抖一下，不重试等于抖一次丢一天；次数上限则是别把过期 Cookie 打成刷单。`),
+          h('span', { key: 'd' }, 'Cookie 会过期（通常几天到几周）。过期后行上会显示「今日失败」，重新复制一次 Cookie 即可。'),
+        ]),
       ])
     }
     //#endregion
@@ -1144,6 +2019,12 @@ window.__ModuleLoader__.load({
       return h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } }, [
         h('div', { key: 'hint', style: accountMetaStyle },
           `按 UTC+8 自然日、**每账号**统计（今日 ${view?.day ?? '—'}）。已用量 = 余额逐包减少量：签到 / 充值 / 到期都不计入，也不会冲抵已用量。某账号达到上限后，只有它自己不再被选中。`),
+        // 今日领取明细：签到渠道（自己加的）与内置渠道的签到都记在同一个 grants
+        // 台账里，不列出来用户会以为「余额涨了但已用没变」是算错了。
+        Number(view?.grantsToday) > 0
+          ? h('div', { key: 'grants', style: accountMetaStyle },
+            `今日已领取 ${view.grantsToday}：${(Array.isArray(view.grants) ? view.grants : []).map(row => `${row.provider} +${row.amount}`).join(' · ')}（领取不计入消耗）`)
+          : null,
         h('div', { key: 'actions', style: toolbarStyle }, [
           h(ActionButton, { key: 'sample', small: true, disabled: controlKey === '', onClick: sampleBalances }, '记录当前余额（更新已用积分）'),
           h(ActionButton, { key: 'reload', small: true, onClick: () => { void load() } }, '重读'),
@@ -1572,6 +2453,7 @@ window.__ModuleLoader__.load({
         })))
       const tabs = [
         { id: 'channels', label: `渠道账号（${CHANNEL_PLATFORMS.length}）` },
+        { id: 'checkin', label: '签到渠道' },
         { id: 'models', label: '按模型' },
         { id: 'credits', label: '积分上限' },
         { id: 'workbuddy', label: 'WorkBuddy' },
@@ -1586,7 +2468,7 @@ window.__ModuleLoader__.load({
         }, [
           h('span', { key: 'text', style: headTextStyle }, [
             h('span', { key: 'name', style: nameStyle }, '账号中心'),
-            h('span', { key: 'desc', style: descriptionStyle }, '13 个渠道账号 + WorkBuddy 的登录、余额、签到；按模型看账号；组合轮换与每日限量'),
+            h('span', { key: 'desc', style: descriptionStyle }, '13 个渠道账号 + WorkBuddy 的登录、余额、签到；自己加的签到渠道；按模型看账号；组合轮换与每日限量'),
           ]),
           h(ChevronDownOutline14, { key: 'chev', open }),
         ]),
@@ -1617,6 +2499,7 @@ window.__ModuleLoader__.load({
             }, item.label))),
           h('div', { key: 'panel', style: sectionStyle }, [
             tab === 'channels' ? channelsBody : null,
+            tab === 'checkin' ? h(CheckinTab, { controlKey, onError: reportError }) : null,
             tab === 'models' ? h(AccountModelTab, {
               rpc,
               platforms: CHANNEL_PLATFORMS,

@@ -1,8 +1,8 @@
 {
   "name": "dsh-auth-hub",
   "displayName": "DSH 账号中心",
-  "version": "0.3.0",
-  "description": "统一账号中心：把 dsh-our-free-model 的 13 个渠道账号与 dsh-workbuddy 的国内/国际账号登录、状态、积分领取整合到一个设置页（界面风格对齐 DSH WorkBuddy）。",
+  "version": "0.5.2",
+  "description": "统一账号中心：13 个内置账号渠道 + 自己加的签到渠道（一键识别 New API 中转站 / 批量导入 / 粘 cURL，自动签到并把奖励记进同一个积分台账）+ WorkBuddy 双区登录，全部收在一个设置页（界面风格对齐 DSH WorkBuddy）。",
   "type": "module",
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
@@ -21,6 +21,8 @@
     "workbuddy-growth.js",
     "credit-usage.js",
     "channel-pack.js",
+    "checkin-channels.js",
+    "checkin-runner.js",
     "vendor/channel-pack/pack.js",
     "vendor/channel-pack/LICENSE",
     "vendor/channel-pack/NOTICE.md",

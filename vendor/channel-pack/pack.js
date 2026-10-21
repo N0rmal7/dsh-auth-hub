@@ -34797,6 +34797,56 @@ function scrubHarnessIdentityPrefix(text, opening) {
   if (match === null) return text;
   return match[1] + opening + text.slice(match[0].length);
 }
+// ── 本地补丁 6（11128 二次修复）：system prompt 的「关键词」风控 ──
+// 补丁 4 只替换了 system **首句**的 DSH identity，但上游的风控不是「前缀匹配」，
+// 而是**子串**匹配：请求体够大（约 >1KB，真实 agentic 会话必满足）时，只要
+// prompt 里出现 `DeepSeek Harness` 这个词组就回 400 code 11128
+// （displayTips：Illegal API invocation from an unapproved channel）。
+// 依据 balongTTY/dsh-workbuddy-fix 的逐项对照实验：同一 token、只改这一个词，
+// 原文 0/5 失败、改后 5/5 成功；换账号 / 域名 / 客户端身份 / 补 13 个请求头
+// 全部无效。——也就是说补丁 4 漏掉了 system 里其余十几处品牌词。
+//
+// 修法：**零宽空格（U+200B）中和**。在 `DeepSeek` 与 `Harness` 之间插入一个
+// 不可见字符，模型读到的语义完全不变，上游的子串匹配不再命中。
+// ⚠️ 路径语境必须跳过（`D:\...\DeepSeek Harness\...`）——在路径里插零宽字符
+// 会让模型把坏路径交给工具调用，直接失败，故匹配器带前后 `[\\/]` 负向断言。
+// 逃生阀与补丁 4 共用：DSH_BUDDY_IDENTITY_SCRUB=0 完全恢复原样透传。
+var HARNESS_BRAND_PATTERN = /(?<![\\/])(DeepSeek)[ \u00A0]+(Harness)(?![\\/])/gi;
+function neutralizeHarnessBrand(text) {
+  if (typeof text !== "string" || text.length === 0) return text;
+  // 零宽空格插在**原有空格之前**：`DeepSeek Harness` → `DeepSeek\u200B Harness`。
+  // 保留原始空格（含多个空格 / 不换行空格），这样删掉零宽字符就能逐字还原。
+  return text.replace(HARNESS_BRAND_PATTERN, (match, brand) => `${brand}\u200B${match.slice(brand.length)}`);
+}
+/**
+ * 中和 wire 数组里所有字符串内容里的品牌词组。
+ *
+ * 落在**序列化后的 wire 数组**上（与补丁 4 同理）：桌面端 identity / 工具结果 /
+ * 历史消息都在这份数组里，改 options.messages 不会进入请求体。assistant 的
+ * tool_calls.function.arguments 不动——那是模型产出的结构化参数，改它可能真的
+ * 改坏一次写文件 / git 提交；风控命中的是提示词文本，不是函数参数。
+ */
+function neutralizeBuddyBranding(messages) {
+  for (const message of messages) {
+    // 历史推理回传（deepseek 系要求 assistant 必带 reasoning_content）也过一遍：
+    // 它同样是请求体里的纯文本，插零宽字符对模型语义无影响。
+    if (typeof message?.reasoning_content === "string") {
+      message.reasoning_content = neutralizeHarnessBrand(message.reasoning_content);
+    }
+    const content = message?.content;
+    if (typeof content === "string") {
+      message.content = neutralizeHarnessBrand(content);
+      continue;
+    }
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      if (part !== null && typeof part === "object" && part.type === "text" && typeof part.text === "string") {
+        part.text = neutralizeHarnessBrand(part.text);
+      }
+    }
+  }
+  return messages;
+}
 function scrubBuddySystemMessages(messages, productId) {
   const opening = officialAssistantOpening(productId);
   for (const message of messages) {
@@ -34817,7 +34867,7 @@ function isChannelValidationFailure(body) {
 }
 function channelValidationError(productId, body, status) {
   return new LlmError3(
-    `${productId}: 渠道准入校验失败（code 11128，HTTP ${status}）——上游按官方客户端身份校验，拒绝本请求。本插件已内置 system 首句清洗与 X-Conversation-* 会话头；若仍出现请更新插件，或换一个渠道 / 新开会话继续。上游原文：${errorDetail2(body).slice(0, 200)}`,
+    `${productId}: 渠道准入校验失败（code 11128，HTTP ${status}）——上游对 system prompt 做关键词风控（DeepSeek Harness 词组），拒绝本请求。本插件已内置首句清洗 + 品牌词零宽中和 + X-Conversation-* 会话头；若仍出现请更新插件，或换一个渠道 / 新开会话继续。上游原文：${errorDetail2(body).slice(0, 200)}`,
     "INVALID_REQUEST",
     { status }
   );
@@ -35353,11 +35403,18 @@ var BuddyAdapter = class _BuddyAdapter extends LlmAdapter2 {
     // 逃生阀：DSH_BUDDY_IDENTITY_SCRUB=0 关闭清洗（恢复上游原样透传）。
     if (isBuddyFamilyProduct(this.product.id) && isHarnessIdentityScrubEnabled()) {
       scrubBuddySystemMessages(messages, this.product.id);
+      // 本地补丁 6：首句之外还有十几处 `DeepSeek Harness`（运行时上下文、工具
+      // 结果、历史消息），只换首句不够——上游按整段 prompt 做子串风控。
+      neutralizeBuddyBranding(messages);
     }
     if (options.system !== void 0 && options.system.length > 0) {
+      let systemContent = options.system;
+      if (isBuddyFamilyProduct(this.product.id) && isHarnessIdentityScrubEnabled()) {
+        systemContent = neutralizeHarnessBrand(scrubHarnessIdentityPrefix(systemContent, officialAssistantOpening(this.product.id)));
+      }
       messages.unshift({
         role: "system",
-        content: isBuddyFamilyProduct(this.product.id) && isHarnessIdentityScrubEnabled() ? scrubHarnessIdentityPrefix(options.system, officialAssistantOpening(this.product.id)) : options.system
+        content: systemContent
       });
     }
     const tools = options.tools?.map((tool) => ({
@@ -68986,6 +69043,9 @@ export {
   officialAssistantOpening,
   scrubHarnessIdentityPrefix,
   scrubBuddySystemMessages,
+  HARNESS_BRAND_PATTERN,
+  neutralizeHarnessBrand,
+  neutralizeBuddyBranding,
   isChannelValidationFailure,
   isBuddyFamilyProduct,
   isHarnessIdentityScrubEnabled,

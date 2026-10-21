@@ -1,10 +1,10 @@
 # vendor/channel-pack — 上游免费渠道包的来源与再构建
 
 本目录是 **[dsh-codearts-auth](https://gitee.com/iJetLi/deepseek-harness-codearts)**
-的完整拷贝，由 `dsh-our-free-model` 的 Host 半身在独立 fiber 上挂载，
+的完整拷贝，由 `dsh-auth-hub` 的 Host 半身在独立 fiber 上挂载，
 使 CodeArts、CodeBuddy、WorkBuddy、LobsterAI、Qoder、Qoder 中国版、TRAE、
 Cline、Loomy、Raccoon、MiniMax Code、ZCode、Gemini 这十三个账号渠道的
-登录流程、账号池、积分领取、模型黑名单与本地 OpenAI 网关可用。OFM 挂载时关闭上游 OpenCode 账号接入，原有匿名免费车道保持独立。
+登录流程、账号池、积分领取、模型黑名单与本地 OpenAI 网关可用。挂载时关闭上游 OpenCode 账号接入，原有匿名免费车道保持独立。
 目录名与内部标识符在本插件的再构建中统一改为 channel-pack；出处与许可证不变。
 
 - 上游仓库：`https://gitee.com/iJetLi/deepseek-harness-codearts`
@@ -15,7 +15,7 @@ Cline、Loomy、Raccoon、MiniMax Code、ZCode、Gemini 这十三个账号渠道
 
 | 路径 | 说明 |
 | --- | --- |
-| `src/` | 上游 TypeScript 源码，包含下述 OFM 本地适配（便于审计与再构建） |
+| `src/` | 上游 TypeScript 源码，包含下述本地适配（便于审计与再构建） |
 | `pack.js` | **插件运行时实际加载的代码**：直接由 `src/` 经 `scripts/build-channel-pack.mjs` 打包成单文件（jose/undici 内联，`@deepseek-ai/*` 保持外部），使发布清单不超文件上限 |
 | `qoder-auth-wasm.wasm` | Qoder 加密推理所需的 WASM，必须与 `pack.js` 同目录（`pack.js` 按 `import.meta.url` 定位它） |
 | `locale/` | 上游文案 |
@@ -41,9 +41,9 @@ OFM_ESBUILD_DIR=/tmp/ofm-channel-build npm run channel-pack
 rm -rf vendor/channel-pack/node_modules
 ```
 
-## OFM 本地适配
+## 本地适配
 
-- `src/index.ts`：增加可选 `disableOpencode` 挂载配置；OFM 开启它时跳过重复 OpenCode adapter、默认匿名账号和能力表预热，保留历史账号及凭据。省略时维持上游行为。
+- `src/index.ts`：增加可选 `disableOpencode` 挂载配置；本插件开启它时跳过重复 OpenCode adapter、默认匿名账号和能力表预热，保留历史账号及凭据。省略时维持上游行为。
 - `src/channel-pack-rpc.ts`：追加同一配置，关闭时拒绝 `opencode.*` 与通用 `account.create(provider=opencode)`。
 - 打包入口改为 `src/index.ts`；宿主模块仍保持外部，jose/undici 内联。
 - 构建依赖固定为 esbuild 0.24.2、jose 6.2.9、undici 8.11.2；本次重构建核对了原包的依赖代码，未借此升级运行依赖。
@@ -53,8 +53,15 @@ rm -rf vendor/channel-pack/node_modules
   依据 workbuddy-experts 逆向的 `templates/workbuddy-prompt.tpl`；逃生阀
   `DSH_BUDDY_IDENTITY_SCRUB=0`）；`send()` 给两个 buddy 渠道都补 `X-Conversation-*`
   三件套；HTTP 400 与流内的 11128 单独分类为「渠道准入校验失败」（不换号、不冷却）。
-  回归测试 29 项：`ofm-debug/cap-test/buddy-identity-test.mjs`。
+  回归测试 29 项：`buddy-identity-test.mjs`。
+
+- **本地补丁 6（v0.5.1，直接打在打包产物上，按 `本地补丁 6` 检索）**：11128 的
+  真因是上游对 system prompt 做**子串**关键词风控（`DeepSeek Harness`，请求体
+  >1KB 时稳定触发），补丁 4 只换首句仍会漏。`BuddyAdapter.stream()` 在 wire 数组
+  上把该词组用零宽空格中和（`DeepSeek\u200B Harness`，语义不变、可逐字还原），
+  跳过路径语境、不动 `tool_calls.arguments`；覆盖所有消息 content 与 `options.system`。
+  回归测试见 `buddy-identity-test.mjs` E 段（11 项）。
 
 本目录**不含**上游的浏览器半身（`plugin-src/client`）与其设置页——
-界面由 `dsh-our-free-model` 自己的三页界面取代，渠道操作经上游的
+界面由 `dsh-auth-hub` 自己的账号中心界面取代，渠道操作经上游的
 `/api/channel-pack` RPC 完成（`connection.rpc.call('/api', 'channel-pack', { method, payload })`）。
