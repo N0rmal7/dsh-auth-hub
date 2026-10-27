@@ -196,6 +196,17 @@ check('报错文案说清「并发槽位」而非泛化错误', () => {
   assert.match(src, /TM\.00001041/, '应回显原始响应码')
 })
 
+check('SSE 流内 TM.00001041 也被摘出「排队」分类', () => {
+  // isSseQueueErrorCode 里必须先把 TM.00001041 排除，否则流内路径仍会静默重试
+  assert.match(src, /function isSseQueueErrorCode\(code\) \{[\s\S]{0,400}if \(isConcurrencyExhausted\(code\)\) return false;/, 
+    'isSseQueueErrorCode 必须先排除并发槽位错误')
+})
+
+check('SSE 流内路径同样计入并发预算并快速失败', () => {
+  assert.match(src, /if \(error instanceof SseQueueRetryError\) \{[\s\S]{0,900}isConcurrencyExhausted/, 
+    'SseQueueRetryError 分支必须处理并发槽位')
+})
+
 console.log('\n=== C. 通用健全性 ===')
 
 check('pack.js 可被 ESM 加载且导出补丁 7 符号', () => {

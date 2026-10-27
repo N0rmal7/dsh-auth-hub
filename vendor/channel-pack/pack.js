@@ -32781,7 +32781,11 @@ function isAuthError(status, body) {
   return body.includes("APIG.0602") || /invalid\s+token|token\s+expired|token\s+is\s+invalid/i.test(body);
 }
 function isSseQueueErrorCode(code) {
-  return code === "TM.00001041" || /81111|TPM|(^|[^0-9])429([^0-9]|$)|rate.?limit|too many requests|排队|限流/i.test(code);
+  // 本地补丁 8：TM.00001041 从「排队」里摘出来 —— 它是账号级并发槽位占满，
+  // 不是排队，重试到天荒地老也不会好（见 isConcurrencyExhausted 的注释）。
+  // SSE 流内返回同样走快速失败，否则 HTTP 400 修好了、流内路径还在空转。
+  if (isConcurrencyExhausted(code)) return false;
+  return /81111|TPM|(^|[^0-9])429([^0-9]|$)|rate.?limit|too many requests|排队|限流/i.test(code);
 }
 function isSseQuotaExhaustedErrorCode(code, message2) {
   return code.includes("4291") || /insufficient[\s_-]+quota/i.test(message2);
@@ -33256,6 +33260,29 @@ var CodeArtsAdapter = class extends LlmAdapter {
             throw new LlmError2(message2, QUOTA_EXCEEDED_CODE, { status: 200 });
           }
           if (error instanceof SseQueueRetryError) {
+            // 本地补丁 8：流内 TM.00001041 与 HTTP 400 同等对待 —— 计入并发槽位预算，
+            // 达阈值即快速失败；否则 HTTP 路径修好了、流内路径还在静默重试。
+            if (isConcurrencyExhausted(error.code ?? error.message)) {
+              concurrencyHits += 1;
+              if (isCodeartsFastFailEnabled() && concurrencyHits >= CONCURRENCY_FAST_FAIL_HITS) {
+                if (this.options.accountPool) {
+                  const next = await this.options.accountPool.getAvailableAccount("codearts", options.model, rateLimitTried);
+                  if (next && !rateLimitTried.has(next.entry.id)) {
+                    rateLimitTried.add(next.entry.id);
+                    credential = next.credential;
+                    currentAccountId = next.entry.id;
+                    authRefreshed = false;
+                    concurrencyHits = 0;
+                    continue;
+                  }
+                }
+                throw new LlmError2(
+                  `codearts: 账号${currentAccountId ? ` ${currentAccountId} ` : ""}的并发会话槽位（3 个）已被占满（流内错误帧），已重试 ${concurrencyHits} 次仍无法获得槽位。请关闭其它正在运行的 CodeArts / CodeArts Agent 会话后重试，或改用其它 provider。原始响应：TM.00001041`,
+                  QUOTA_EXCEEDED_CODE,
+                  { status: 200 }
+                );
+              }
+            }
           } else if (error instanceof LlmError2 && error.code === BENEFIT_NOT_FOUND_CODE && isBenefitModel && !benefitHeaderDropped) {
             benefitHeaderDropped = true;
             continue;
