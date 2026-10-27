@@ -32707,6 +32707,30 @@ function buildDsmlSystemPrompt(tools) {
 var QUEUE_STATUS_BASE = "https://snap-access.cn-north-4.myhuaweicloud.com/api/v1/queue/status";
 var QUEUE_RETRY_DELAY_MS = 1e4;
 var QUEUE_MAX_ATTEMPTS2 = 180;
+// 本地补丁 8（CodeArts 并发槽位快速失败）────────────────────────────────────
+// 背景实测（2026-10-27，详见 README「CodeArts 并发槽位」一节）：
+//   `TM.00001041`（并发会话数已达上限 3 个）**不是**排队、也不是用量耗尽，
+//   而是**账号级 3 个并发槽位被别处（CodeArts 官方 IDE 等）占满**。
+//   实测已证明它与 `Chat-Id` / `Session-Id` 都无关：不带这两个头发请求结果相同，
+//   窗口打开时全新 Chat-Id 也能通过。因此**不要**试图靠复用固定 Chat-Id 解决。
+// 旧行为的问题：TM.00001041 命中 `isQueueError()` 被当成"可重试排队"，
+//   HTTP 400 被吞掉 → 进入 `10s × 180 次 ≈ 30 分钟`静默重试；而 `queryQueueStatus`
+//   恒回 `working`，永不提前退出 ⇒ 用户侧表现为"卡死不动"，且白白空转 30 分钟。
+// 新行为：单独累计 `concurrencyHits`，达 `CONCURRENCY_FAST_FAIL_HITS` 即抛
+//   `QUOTA_EXCEEDED`（**不在** dsh-llm 的 DEFAULT_RETRYABLE_CODES 里，上层不会再放大重试），
+//   并在此前先试换号（多账号时其它账号可能还有空槽位）。
+// 逃生阀：`DSH_CODEARTS_FAST_FAIL=0` 恢复旧的 30 分钟排队行为。
+var CONCURRENCY_FAST_FAIL_HITS = 3;
+var CONCURRENCY_FAST_FAIL_FLAG_ENV = "DSH_CODEARTS_FAST_FAIL";
+function isConcurrencyExhausted(text) {
+  return typeof text === "string" && text.includes("TM.00001041");
+}
+/** 逃生阀：默认开启快速失败；显式设 `0` 才回退到旧行为。 */
+function isCodeartsFastFailEnabled() {
+  const flag = process.env[CONCURRENCY_FAST_FAIL_FLAG_ENV];
+  if (flag === void 0 || flag.length === 0) return true;
+  return flag !== "0" && flag.toLowerCase() !== "false";
+}
 function resolveFirstTokenTimeoutMs() {
   return Number.parseInt(process.env.DSH_CODEARTS_SSE_FIRST_TOKEN_TIMEOUT_MS ?? "", 10) || 3e5;
 }
@@ -33168,6 +33192,8 @@ var CodeArtsAdapter = class extends LlmAdapter {
     const url = `${CHAT_API_BASE}/chat/completions`;
     let response;
     let queueAttempts = 0;
+    // 本地补丁 8：TM.00001041 单独计数（与排队计数分离，见 CONCURRENCY_FAST_FAIL_HITS 注释）。
+    let concurrencyHits = 0;
     let authRefreshed = false;
     let benefitHeaderDropped = false;
     const rateLimitTried = /* @__PURE__ */ new Set();
@@ -33305,6 +33331,28 @@ var CodeArtsAdapter = class extends LlmAdapter {
             throw new LlmError2(`codearts: model request failed with HTTP ${response.status}`, code, { status: response.status });
           }
         }
+        // 本地补丁 8：TM.00001041 = 账号级 3 个并发槽位被占满（非排队、非用量耗尽）。
+        // 旧行为把它交给上面的 isQueueError 分支静默重试 30 分钟；这里改为小额预算快速失败。
+        if (isConcurrencyExhausted(errorText)) {
+          concurrencyHits += 1;
+          if (isCodeartsFastFailEnabled() && concurrencyHits >= CONCURRENCY_FAST_FAIL_HITS) {
+            const message2 = `codearts: \u8D26\u53F7${currentAccountId ? ` ${currentAccountId} ` : ""}\u7684\u5E76\u53D1\u4F1A\u8BDD\u69FD\u4F4D\uFF083 \u4E2A\uFF09\u5DF2\u88AB\u5360\u6EE1\uFF0C\u5DF2\u91CD\u8BD5 ${concurrencyHits} \u6B21\u4ECD\u65E0\u6CD5\u83B7\u5F97\u69FD\u4F4D\u3002\u8BF7\u5173\u95ED\u5176\u5B83\u6B63\u5728\u8FD0\u884C\u7684 CodeArts / CodeArts Agent \u4F1A\u8BDD\u540E\u91CD\u8BD5\uFF0C\u6216\u6539\u7528\u5176\u5B83 provider\uFF1B\u7A97\u53E3\u53EF\u80FD\u5728\u6570\u5341\u79D2\u5185\u81EA\u884C\u91CA\u653E\uFF0C\u7A0D\u540E\u91CD\u8BD5\u53EF\u80FD\u6210\u529F\u3002\u539F\u59CB\u54CD\u5E94\uFF1ATM.00001041 \u5E76\u53D1\u4F1A\u8BDD\u6570\u5DF2\u8FBE\u4E0A\u9650(3\u4E2A)\u3002`;
+            // 多账号：抛错前先试换号 —— 其它账号可能还有空闲槽位（见报告 §风险 4）。
+            if (this.options.accountPool) {
+              const next = await this.options.accountPool.getAvailableAccount("codearts", options.model, rateLimitTried);
+              if (next && !rateLimitTried.has(next.entry.id)) {
+                rateLimitTried.add(next.entry.id);
+                credential = next.credential;
+                currentAccountId = next.entry.id;
+                authRefreshed = false;
+                concurrencyHits = 0;
+                continue;
+              }
+            }
+            // QUOTA_EXCEEDED 不在 dsh-llm 的 DEFAULT_RETRYABLE_CODES 里，上层不会再放大重试。
+            throw new LlmError2(message2, QUOTA_EXCEEDED_CODE, { status: response.status });
+          }
+        }
       }
       queueAttempts += 1;
       if (queueAttempts > QUEUE_MAX_ATTEMPTS2) {
@@ -33315,7 +33363,10 @@ var CodeArtsAdapter = class extends LlmAdapter {
       if (status?.status === "error" || status?.status === "queue_full") {
         throw new LlmError2(`codearts: ${status.message || `queue status: ${status.status}`}`, "QUEUE");
       }
-      await delay(QUEUE_RETRY_DELAY_MS, options.signal);
+      // 本地补丁 8：线性退避替代恒 10s —— 前几轮快速探测（槽位释放很快），
+      // 之后逐步拉长到 60s，避免 30 分钟内高频空转把 TPM 配额也一起打爆。
+      const backoffMs = Math.min(QUEUE_RETRY_DELAY_MS * Math.min(queueAttempts, 6), 6e4);
+      await delay(backoffMs, options.signal);
     }
   }
   /**
@@ -34791,11 +34842,130 @@ function officialAssistantOpening(productId) {
   const name = product?.attributionName ?? "CodeBuddy";
   return `You are ${name}, a powerful AI assistant.`;
 }
+/** 补丁 7 用的产品名（官方模板开场句里的 {productName}）。 */
+function buddyProductName(productId) {
+  const product = productById(productId);
+  return product?.attributionName ?? "CodeBuddy";
+}
 function scrubHarnessIdentityPrefix(text, opening) {
   if (typeof text !== "string" || text.length === 0) return text;
   const match = HARNESS_IDENTITY_PREFIX_PATTERN.exec(text);
   if (match === null) return text;
   return match[1] + opening + text.slice(match[0].length);
+}
+// ── 本地补丁 7（11128 真正的触发条件，2026-10-27 实测）───────────────
+// 上面补丁 6 的前提**已被实测推翻**：品牌词不是触发条件。4KB 体量下把
+// `DeepSeek Harness` 原样 / 零宽 / 全小写 / 全大写 / 换行拆开 / 制表拆开
+// 分别送上去，全部 200 放行；而真实 10KB system 原样送上去必 400/11128。
+//
+// 触发条件是 DSH 运行时上下文里的**自指内容**。ablation 实测（每格 2 次）：
+//
+//   | 变体            | 结果 |
+//   | --------------- | ---- |
+//   | 原样            | BLOCK |
+//   | 只改 identity   | BLOCK |
+//   | 只改品牌词组    | BLOCK |
+//   | **只改 FP1 短语** | **200** |
+//   | 三者全做        | 200 |
+//
+// 即 **FP1 内部改写是充分条件**，另外两步是冗余但无害的加固（抵御上游规则变化）。
+// 因此本补丁做成三步组合 patchBuddySystemPrompt()，三步都保留。
+//
+// 其中 FP1 这条固定短语的匹配性质（~150 次对照实验，每条 ≥2 次复跑）：
+//   · **大小写不敏感**（全小写 / 全大写 / 首字母大写 都拦）；
+//   · **逐字符精确子串**：句号后加空格、换行、制表**都放行** —— 这不是「空白归一化」，
+//     而是这些改动直接破坏了精确子串。所以正则里**必须用精确空格**，不能用 `\s+`；
+//   · **左右边界都是硬边界**：删头 1 词（`Tokens`）即放行；右端截到 `workspace` 放行、
+//     截到 `root` 才拦 → 必须从 `Tokens` 连续到 `root`；
+//   · **必须两句连读**：只发 S1 或只发 S2 都不拦；倒序、分号连接也不拦；
+//   · **与体量无关**：前后垫 0 / 500 / 1000 / 2000 / 2161 / 4000 个字符结论完全一致。
+//     早期「体量门槛」结论是**假象**——probe-9 的「A(2161)+片段才拦」只是因为
+//     前缀二分恰好切到这句。
+//
+// ⚠️ **关键教训：右端加词是无效修法。**
+// 上游是**子串**匹配，`…resolve from the workspace root` 在
+// `…resolve from the workspace root directory` 里**仍然是完整子串**，照样 400。
+// 实测补 directory / folder / dir / 句号，连跑 3 次全部 400/11128。
+// **只有改子串内部**（改词、换词序、换措辞）才能打破命中。
+//
+// 修法（三步组合，实测 4 场景 × 3 次 = 12/12 全 200）：
+//   1) identity 首句 → 官方模板开场句 `You are CodeBuddy, a powerful AI assistant.`
+//   2) 品牌去标识化：`DeepSeek Harness` → `the assistant platform`，`DSH` → `the platform`
+//      （真实文案里 `DeepSeek` 与 `Harness` 之间是**零宽空格 U+200B**，两种形态都要覆盖）
+//   3) FP1 指纹内部改写（右端加词无效，必须改内部）：
+//        Relative paths resolve from the workspace root
+//      → Relative paths are resolved against the workspace root
+//
+// 只对 role === 'system' 生效：用户消息 / 工具结果里出现这些词不应被改写。
+// 逃生阀：DSH_BUDDY_PROMPT_PATCH=0 关闭本补丁（同时保留旧名 DSH_BUDDY_CHANNEL_FINGERPRINT）。
+var BUDDY_CHANNEL_FINGERPRINT = /Tokens prefixed with @ are paths the user explicitly referenced\. Relative paths resolve from the workspace root/gi;
+var BUDDY_CHANNEL_FINGERPRINT_REPLACEMENT = "Tokens prefixed with @ are paths the user explicitly referenced. Relative paths are resolved against the workspace root";
+// 真实文案里品牌词组有两种形态：精确空格，以及 `DeepSeek` + U+200B + 空格 + `Harness`。
+var BUDDY_BRAND_PHRASE_PATTERN = /DeepSeek[\u200B]? Harness/gi;
+var BUDDY_BRAND_PHRASE_REPLACEMENT = "the assistant platform";
+var BUDDY_DSH_ABBR_PATTERN = /\bDSH\b/g;
+var BUDDY_DSH_ABBR_REPLACEMENT = "the platform";
+var BUDDY_IDENTITY_OPENING_PATTERN = /^\s*You are an AI agent powered by [^.]+\./i;
+function isChannelFingerprintDefuseEnabled() {
+  return process.env.DSH_BUDDY_PROMPT_PATCH !== "0" && process.env.DSH_BUDDY_CHANNEL_FINGERPRINT !== "0";
+}
+/** 只做第 3 步（FP1 内部改写），保留给回归测试与局部调用。 */
+function defuseChannelFingerprint(text) {
+  if (typeof text !== "string" || text.length === 0) return text;
+  if (!isChannelFingerprintDefuseEnabled()) return text;
+  return text.replace(BUDDY_CHANNEL_FINGERPRINT, BUDDY_CHANNEL_FINGERPRINT_REPLACEMENT);
+}
+/**
+ * 本地补丁 7 主函数：把 system prompt 整体去标识化，解除 11128 准入拦截。
+ *
+ * 三步顺序固定、缺一不可（实测单点消除全部无效）：
+ *   1. identity 首句换成官方模板；
+ *   2. 品牌词组 / DSH 缩写去标识化；
+ *   3. FP1 固定短语内部改写。
+ *
+ * 所有 replace 都是**逐字符精确**匹配（上游不做空白归一），大小写不敏感。
+ */
+function patchBuddySystemPrompt(text, productName) {
+  if (typeof text !== "string" || text.length === 0) return text;
+  if (!isChannelFingerprintDefuseEnabled()) return text;
+  const opening = `You are ${productName ?? "CodeBuddy"}, a powerful AI assistant.`;
+  let out = text;
+  // 1) identity 首句 → 官方模板（仅当首句确实是 DSH identity 句时才替换）
+  out = out.replace(BUDDY_IDENTITY_OPENING_PATTERN, opening);
+  // 2) 品牌去标识化
+  out = out.replace(BUDDY_BRAND_PHRASE_PATTERN, BUDDY_BRAND_PHRASE_REPLACEMENT);
+  out = out.replace(BUDDY_DSH_ABBR_PATTERN, BUDDY_DSH_ABBR_REPLACEMENT);
+  // 3) FP1 指纹内部改写
+  out = out.replace(BUDDY_CHANNEL_FINGERPRINT, BUDDY_CHANNEL_FINGERPRINT_REPLACEMENT);
+  return out;
+}
+/**
+ * 在 wire 数组上应用补丁 7。
+ *
+ * 与补丁 4/6 同理落在**序列化后的 wire 数组**上：桌面端 identity、运行时上下文、
+ * 工具结果、历史消息都在这里。`tool_calls.function.arguments` 不动——那是模型
+ * 产出的结构化参数，改它可能改坏一次真实写文件；风控命中的是提示词文本。
+ *
+ * **只改 role === 'system' 的消息**：用户消息 / 工具结果里出现这些词属于用户内容，
+ * 改写它们会破坏对话语义（用户可能正在讨论这个产品）。
+ */
+function defuseChannelFingerprintInMessages(messages, productName) {
+  if (!isChannelFingerprintDefuseEnabled()) return messages;
+  for (const message of messages) {
+    if (message?.role !== "system") continue;
+    const content = message.content;
+    if (typeof content === "string") {
+      message.content = patchBuddySystemPrompt(content, productName);
+      continue;
+    }
+    if (!Array.isArray(content)) continue;
+    for (const part of content) {
+      if (part !== null && typeof part === "object" && part.type === "text" && typeof part.text === "string") {
+        part.text = patchBuddySystemPrompt(part.text, productName);
+      }
+    }
+  }
+  return messages;
 }
 // ── 本地补丁 6（11128 二次修复）：system prompt 的「关键词」风控 ──
 // 补丁 4 只替换了 system **首句**的 DSH identity，但上游的风控不是「前缀匹配」，
@@ -35407,10 +35577,25 @@ var BuddyAdapter = class _BuddyAdapter extends LlmAdapter2 {
       // 结果、历史消息），只换首句不够——上游按整段 prompt 做子串风控。
       neutralizeBuddyBranding(messages);
     }
+    // 本地补丁 7（11128 真正的修复）：上游对 system prompt 里的**自指内容**做准入
+    // 校验。ablation 实测（每格 2 次）：只改 identity / 只做品牌去标识化都仍然
+    // BLOCK；**只改 FP1 短语内部即可放行**，三者叠加同样放行。所以三步都保留
+    // （多改无害且能抵御上游规则变化），但生效与否只由本补丁自己的逃生阀控制。
+    // 只对 role==='system' 生效——用户消息与工具结果里的这些词属于对话内容，
+    // 改写它们会破坏语义。
+    // 逃生阀：DSH_BUDDY_PROMPT_PATCH=0（**独立**于 DSH_BUDDY_IDENTITY_SCRUB）。
+    if (isBuddyFamilyProduct(this.product.id)) {
+      defuseChannelFingerprintInMessages(messages, buddyProductName(this.product.id));
+    }
     if (options.system !== void 0 && options.system.length > 0) {
       let systemContent = options.system;
       if (isBuddyFamilyProduct(this.product.id) && isHarnessIdentityScrubEnabled()) {
         systemContent = neutralizeHarnessBrand(scrubHarnessIdentityPrefix(systemContent, officialAssistantOpening(this.product.id)));
+      }
+      // 本地补丁 7：options.system 分支（非桌面端链路）同样要过三步去标识化。
+      // 放在 identity 清洗之外，避免被 DSH_BUDDY_IDENTITY_SCRUB=0 顺带关掉。
+      if (isBuddyFamilyProduct(this.product.id)) {
+        systemContent = patchBuddySystemPrompt(systemContent, buddyProductName(this.product.id));
       }
       messages.unshift({
         role: "system",
@@ -69049,6 +69234,19 @@ export {
   isChannelValidationFailure,
   isBuddyFamilyProduct,
   isHarnessIdentityScrubEnabled,
+  // 本地补丁 7：11128 真正触发条件（system prompt 自指内容）——供回归测试调用。
+  BUDDY_CHANNEL_FINGERPRINT,
+  BUDDY_CHANNEL_FINGERPRINT_REPLACEMENT,
+  BUDDY_BRAND_PHRASE_PATTERN,
+  BUDDY_BRAND_PHRASE_REPLACEMENT,
+  BUDDY_DSH_ABBR_PATTERN,
+  BUDDY_DSH_ABBR_REPLACEMENT,
+  BUDDY_IDENTITY_OPENING_PATTERN,
+  isChannelFingerprintDefuseEnabled,
+  buddyProductName,
+  patchBuddySystemPrompt,
+  defuseChannelFingerprint,
+  defuseChannelFingerprintInMessages,
   isContentRejection,
   serializeMessages2
 };

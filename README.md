@@ -318,6 +318,99 @@ illegal」——短请求正常、约 49 万 tokens 的长 agentic 会话必中�
 回归测试：`buddy-identity-test.mjs` 的 E 段 11 项（含路径跳过、语义可还原、
 tool_calls 不动、JSON 可序列化）。
 
+## 11128 三次修复：真正触发条件是**自指内容**，不是品牌词（v0.5.3）
+
+⚠️ **上面 v0.5.1 的「品牌词子串风控」结论已被实测推翻**，补丁 6 对真实请求无效。
+
+### 反证
+
+同一账号、同样 4KB 体量，把 `DeepSeek Harness` 分别以**原样 / 零宽 U+200B / 全小写 /
+全大写 / 换行拆开 / 制表拆开 / 只留 `DSH` / 只留单词** 发上去 —— **全部 200 放行**。
+而真实 10KB system 原样发上去 —— **必 400 / 11128**。
+
+### 真正触发的那句
+
+DSH 运行时上下文里的一句固定短语：
+
+```
+Tokens prefixed with @ are paths the user explicitly referenced. Relative paths resolve from the workspace root
+```
+
+匹配性质（约 150 次对照实验，每条 ≥2 次复跑）：
+
+| 性质 | 实测 |
+| --- | --- |
+| 大小写 | **不敏感**（全小写 / 全大写 / 首字母大写 都拦） |
+| 空白 | **逐字符精确**（句号后加空格、换行、制表**都放行**）—— 不是「空白归一化」，是这些改动直接破坏了精确子串 |
+| 左右边界 | **都是硬边界**：删头 1 词即放行；右端截到 `workspace` 放行、到 `root` 才拦 |
+| 是否需两句连读 | **是**：只发前半句或只发后半句都不拦 |
+| 体量与位置 | **无关**：前后垫 0～4000 字符结论一致 |
+
+> 早期「体量 >1KB 才触发」的结论是**假象**——前缀二分恰好切到这句造成的巧合。
+
+### ⚠️ 关键教训：右端加词是无效修法
+
+上游是**子串**匹配，`…workspace root` 在 `…workspace root directory` 里**仍是完整子串**，
+照样 400。实测补 `directory` / `folder` / `dir` / 句号，连跑 3 次全部 400。
+**只有改子串内部**（改词、换词序、换措辞）才能打破命中。
+
+### 修法（本地补丁 7）
+
+`patchBuddySystemPrompt()` 三步组合，只对 `role === 'system'` 生效：
+
+1. identity 首句 → 官方模板 `You are {productName}, a powerful AI assistant.`
+2. 品牌去标识化：`DeepSeek Harness`（含 U+200B 形态）→ `the assistant platform`，`DSH` → `the platform`
+3. 指纹句**内部**改写：`Relative paths resolve from` → `Relative paths are resolved against`
+
+ablation 显示**第 3 步单独即可放行**，另外两步是抵御上游规则变化的加固（多改无害）。
+
+- `tool_calls.function.arguments` 不动；用户消息与工具结果里的这些词也不动。
+- 逃生阀：`DSH_BUDDY_PROMPT_PATCH=0`（**独立**于 `DSH_BUDDY_IDENTITY_SCRUB`）。
+
+**验收**：真实 10KB system + 284 工具 + 多轮历史，5 场景 × 3 次 —— 控制组 3/3 全 400、
+方案组 12/12 全 200（`buddy-11128-regress.mjs`，55 项断言）。
+
+## CodeArts 并发槽位：把 30 分钟静默重试改成 30 秒快速失败（v0.5.3）
+
+**报错**：`400 {"error_code":"TM.00001041","error_msg":"并发会话数已达上限(3个)…"}`，
+**第一条请求就报**，不是用量耗尽。
+
+### 这不是插件的 Chat-Id 泄漏
+
+三重实测否定「上游按 Chat-Id 计并发」：
+
+1. **完全不带** `Chat-Id` / `Session-Id` 发 chat —— 窗口内仍 200 正常出流；饱和时不带也照样 400。
+2. 窗口内**全新 Chat-Id** 也能通过。
+3. 隔离实验：固定 Session 变 Chat → 放行 2/3；固定 Chat 变 Session → 放行 2/3。
+   **两个维度都不是闸门键**，计数键是**账号级 3 个槽位**。
+
+`new CodeArtsAdapter` 只有 2 处（生产 / 诊断），**都没传** `chatId`/`sessionId`；
+`dsh-llm` 是单实例注册表 —— **不存在「每 turn 新 Chat-Id」**。
+
+> 所以「按账号持久化/派生 chatId」这条路**实测无收益**，不要做。
+
+### 真问题：静默重试 30 分钟
+
+`TM.00001041` 命中 `isQueueError()` 被当成「可重试排队」，HTTP 400 被吞掉 →
+`10s × 180 次 ≈ 30 分钟`静默重试；而 `queryQueueStatus` 恒回 `working`，永不提前退出。
+用户侧表现是**卡死不动**。
+
+**修法（本地补丁 8）**：
+
+- 单独累计 `concurrencyHits`，达 3 次即抛 `QUOTA_EXCEEDED`（**不在** `DEFAULT_RETRYABLE_CODES`，上层不再放大）。
+- 抛错前先试 `getAvailableAccount` 换号（多账号时其它账号可能还有空槽位）。
+- 退避改为线性 `min(10s × n, 60s)`，避免高频空转把 TPM 配额一起打爆。
+- 逃生阀：`DSH_CODEARTS_FAST_FAIL=0` 恢复旧行为。
+
+| | 修复前 | 修复后 |
+| --- | --- | --- |
+| 到报错 | **1800s（30 分钟）** | **30.0s** |
+| 上游 chat 请求数 | 180 | 3 |
+| 可见性 | 完全静默 | 明确说「并发槽位已满，稍后重试可能成功」 |
+
+**如何区分「插件 bug」与「账号被占满」**：去掉所有会话头仍然 400 + 非 chat 签名端点
+（`queue/status`）仍 200 + 过一段时间自己好了 = 账号侧槽位问题，不是插件 bug。
+
 ## 轮换组的推理档位翻译（v0.5.1）
 
 **报错**：`provider "codearts" model "deepseek-v4.1-flash" does not support

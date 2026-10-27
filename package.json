@@ -1,7 +1,7 @@
 {
   "name": "dsh-auth-hub",
   "displayName": "DSH 账号中心",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "统一账号中心：13 个内置账号渠道 + 自己加的签到渠道（一键识别 New API 中转站 / 批量导入 / 粘 cURL，自动签到并把奖励记进同一个积分台账）+ WorkBuddy 双区登录，全部收在一个设置页（界面风格对齐 DSH WorkBuddy）。",
   "type": "module",
   "engines": {
@@ -27,7 +27,8 @@
     "vendor/channel-pack/LICENSE",
     "vendor/channel-pack/NOTICE.md",
     "cordis.patch.yml",
-    "README.md"
+    "README.md",
+    "test-local-patches.mjs"
   ],
   "license": "MIT",
   "dsh": {

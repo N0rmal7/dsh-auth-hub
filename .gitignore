@@ -9,3 +9,7 @@ Thumbs.db
 # 本地调试与测试输出
 *.tsbuildinfo
 coverage/
+
+# 本地排障工作目录：含真实凭据的探针脚本与上游原始响应，绝不入库
+.probe/
+*.bak-*
