@@ -2087,6 +2087,8 @@ window.__ModuleLoader__.load({
       const [login, setLogin] = useState(null)
       const [growth, setGrowth] = useState(undefined)
       const [growthError, setGrowthError] = useState('')
+      // 多账号清扫的逐个结果（来自 Host 的 `accounts[]`）；undefined = 还没跑过 / 单账号旧响应
+      const [growthAccounts, setGrowthAccounts] = useState(undefined)
 
       const accounts = entry?.accounts
       const status = entry?.status
@@ -2148,17 +2150,66 @@ window.__ModuleLoader__.load({
         try {
           if (controlKey === '') throw new Error('拿不到 controlKey（Host 半身未加载）')
           const payload = await postGrowthSweep(controlKey, channel.provider)
-          const result = payload?.result ?? {}
-          const parts = []
-          if (result.accepted > 0) parts.push(`接收 ${result.accepted} 个任务`)
-          if (result.claimedTasks > 0) parts.push(`领取 ${result.claimedTasks} 个任务`)
-          if (result.claimedCredits > 0) parts.push(`+${result.claimedCredits} 积分`)
-          if (result.trip?.dispatched === true) parts.push('已派猫猫出门')
-          if (result.trip?.reason === 'traveling') parts.push('猫猫还在路上')
-          if (result.trip?.reason === 'daily-limit') parts.push('今日旅行已达上限')
-          if (result.streakDays !== undefined) parts.push(`连登 ${result.streakDays} 天`)
-          if (Array.isArray(result.errors) && result.errors.length > 0) parts.push(`${result.errors.length} 步失败`)
-          setNotice(parts.length > 0 ? parts.join('，') : '没有可领取的')
+          // 多账号：Host 侧现在会遍历该 provider 下**全部启用账号**，
+          // 返回 `{ accounts: [{accountId, nickname, result?, error?}], totals }`。
+          // 单账号旧响应只有 `{ result }`，这里两条路径都兼容。
+          const rows = Array.isArray(payload?.accounts) ? payload.accounts : undefined
+          const totals = payload?.totals
+          if (rows !== undefined && totals !== undefined) {
+            const okRows = rows.filter(row => row.result !== undefined)
+            const badRows = rows.filter(row => row.error !== undefined)
+            const parts = [`${okRows.length}/${rows.length} 个账号`]
+            if (totals.claimedTasks > 0) parts.push(`领取 ${totals.claimedTasks} 个任务`)
+            if (totals.claimedCredits > 0) parts.push(`+${totals.claimedCredits} 积分`)
+            if (totals.streakDays !== undefined) parts.push(`连登 ${totals.streakDays} 天`)
+            // 诚实告知：成长任务绝大多数需要**真实使用产品**（召唤专家 / 用模板 /
+            // 设自动化 / 关注公众号满 24h），协议层无法完成（实测 /v2/report 是埋点，
+            // 成长 API 里没有任何写进度的通道）。不显示这一条，用户只会看到
+            // 「0 个任务 +0 积分」，以为清扫功能坏了 —— 这正是最初的投诉。
+            const unfinishableCount = Number(totals.unfinishableCount) > 0
+              ? Number(totals.unfinishableCount)
+              : rows.reduce((sum, row) => sum + (Array.isArray(row.result?.unfinishable) ? row.result.unfinishable.length : 0), 0)
+            const unfinishableCredits = Number(totals.unfinishableCredits) > 0
+              ? Number(totals.unfinishableCredits)
+              : rows.reduce((sum, row) => sum + (Number(row.result?.unfinishableCredits) || 0), 0)
+            if (unfinishableCount > 0) {
+              parts.push(unfinishableCredits > 0
+                ? `${unfinishableCount} 个任务需真实使用产品（+${unfinishableCredits} 积分待操作）`
+                : `${unfinishableCount} 个任务需真实使用产品`)
+            }
+            if (badRows.length > 0) parts.push(`${badRows.length} 个失败`)
+            setNotice(parts.join('，'))
+            // 失败必须说清是哪个账号、什么原因（不能只报个总数）。
+            setGrowthAccounts(rows.map(row => ({
+              accountId: row.accountId,
+              nickname: row.nickname,
+              ok: row.result !== undefined,
+              credits: Number(row.result?.claimedCredits) > 0 ? Number(row.result.claimedCredits) : 0,
+              tasks: Number(row.result?.claimedTasks) > 0 ? Number(row.result.claimedTasks) : 0,
+              error: row.error,
+            })))
+          } else {
+            const result = payload?.result ?? {}
+            const parts = []
+            if (result.accepted > 0) parts.push(`接收 ${result.accepted} 个任务`)
+            if (result.claimedTasks > 0) parts.push(`领取 ${result.claimedTasks} 个任务`)
+            if (result.claimedCredits > 0) parts.push(`+${result.claimedCredits} 积分`)
+            if (result.trip?.dispatched === true) parts.push('已派猫猫出门')
+            if (result.trip?.reason === 'traveling') parts.push('猫猫还在路上')
+            if (result.trip?.reason === 'daily-limit') parts.push('今日旅行已达上限')
+            if (result.streakDays !== undefined) parts.push(`连登 ${result.streakDays} 天`)
+            if (Array.isArray(result.errors) && result.errors.length > 0) parts.push(`${result.errors.length} 步失败`)
+            // 同多账号分支：如实告知「这些任务协议层做不到」，而不是让用户
+            // 看到「没有可领取的」就以为功能坏了。
+            if (Array.isArray(result.unfinishable) && result.unfinishable.length > 0) {
+              const credits = Number(result.unfinishableCredits) || 0
+              parts.push(credits > 0
+                ? `${result.unfinishable.length} 个任务需真实使用产品（+${credits} 积分待操作）`
+                : `${result.unfinishable.length} 个任务需真实使用产品`)
+            }
+            setNotice(parts.length > 0 ? parts.join('，') : '没有可领取的')
+            setGrowthAccounts(undefined)
+          }
           await loadGrowth()
           onRefresh(true)
         } catch (error) { onError(channel, error) } finally { setBusy('') }
@@ -2216,6 +2267,23 @@ window.__ModuleLoader__.load({
           notice !== '' ? h('div', { key: 'notice', style: bodyStyle }, notice) : null,
           entry?.error !== undefined ? h('div', { key: 'err', style: errorStyle }, entry.error) : null,
           growthError !== '' ? h('div', { key: 'gerr', style: errorStyle }, `成长中心：${growthError}`) : null,
+          // 多账号清扫结果：逐个列出，失败的说清是哪个账号、什么原因。
+          Array.isArray(growthAccounts) && growthAccounts.length > 0
+            ? h('div', { key: 'gaccts', style: accountItemStyle },
+              growthAccounts.map(row => h('div', {
+                key: row.accountId,
+                style: { display: 'flex', justifyContent: 'space-between', gap: 8, fontSize: 12 },
+              }, [
+                h('span', { key: 'n', style: { color: 'var(--dsw-alias-label-secondary)' } },
+                  `${row.ok ? '✓' : '✗'} ${row.nickname || row.accountId}`),
+                h('span', {
+                  key: 'v',
+                  style: { color: row.ok ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-state-error-primary)', textAlign: 'right' },
+                }, row.ok
+                  ? [row.tasks > 0 ? `${row.tasks} 任务` : '', row.credits > 0 ? `+${row.credits}` : ''].filter(Boolean).join(' · ') || '无奖励'
+                  : String(row.error ?? '失败').slice(0, 120)),
+              ])))
+            : null,
           growth === null ? h('div', { key: 'gnone', style: accountMetaStyle }, '成长中心：未登录或无数据') : null,
           growth !== undefined && growth !== null ? h('div', { key: 'growth', style: accountItemStyle }, [
             h('div', { key: 'row', style: rowStyle }, [
