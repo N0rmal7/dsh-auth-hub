@@ -62065,6 +62065,19 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
         }
         const product = productById(req.provider);
         if (product === void 0) {
+          // Kimi 无签到活动（积分来自订阅与任务），status 恒 null。
+          // 与 codearts / trae / cline / loomy 的「无独立状态端点」分支同款：
+          // 必须提前返回，否则落到这条 bad-request，账号卡片被标成查询失败
+          // （CodeArts 历史事故同款 —— 见本 case 开头注释）。
+          if (req.provider === KIMI.id) {
+            const kimiStatusAccounts = await pool.listAccounts(req.provider);
+            return {
+              ok: true,
+              value: {
+                accounts: kimiStatusAccounts.map((entry) => ({ accountId: entry.id, nickname: entry.nickname, status: null }))
+              }
+            };
+          }
           return { ok: false, error: { code: "bad-request", message: `unsupported provider: ${req.provider}` } };
         }
         const accounts = await pool.listAccounts(req.provider);
@@ -62236,6 +62249,14 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
         }
         const product = productById(req.provider);
         if (product === void 0) {
+          // Kimi 无每日签到可领（积分来自订阅额度与任务 claim），诚实返回
+          // 「无可领取项」而不是 bad-request —— 否则点「领取今日积分」会报错。
+          if (req.provider === KIMI.id) {
+            return {
+              ok: true,
+              value: { results: [], summary: { claimed: 0, alreadyClaimed: 0, pendingRefresh: 0, inactive: 0, failed: 0, totalCredit: 0 } }
+            };
+          }
           return { ok: false, error: { code: "bad-request", message: `unsupported provider: ${req.provider}` } };
         }
         const value = await collectClaimResults(accounts, product, {
@@ -62576,6 +62597,24 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
         }
         const product = productById(req.provider);
         if (product === void 0) {
+          // Kimi：上游无余额端点（积分来自订阅与任务领取，没有可查询的
+          // 「余额」数字），返回 balance: null + 可读说明。与 loomy 的
+          // 「凭据未配置」形态一致 —— 卡片显示原因而非报错。
+          // 必须提前返回：落到 bad-request 会把账号卡片标成「余额查询失败」
+          //（CodeArts 历史事故同款，见 credits.status 开头注释）。
+          if (req.provider === KIMI.id) {
+            return {
+              ok: true,
+              value: {
+                accounts: accounts.map((entry) => ({
+                  accountId: entry.id,
+                  nickname: entry.nickname,
+                  balance: null,
+                  error: void 0
+                }))
+              }
+            };
+          }
           return { ok: false, error: { code: "bad-request", message: `unsupported provider: ${req.provider}` } };
         }
         const values = await collectCreditBalances(accounts, product, {

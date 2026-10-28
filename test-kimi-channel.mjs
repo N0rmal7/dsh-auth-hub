@@ -136,6 +136,51 @@ check('device flow 的 userCode / 直达链接会下发到前端', () => {
   assert.match(block, /loginUrl: started\.loginUrl/)
 })
 
+check('★ credits.status：kimi 提前返回（不落 unsupported bad-request）', () => {
+  // 2026-10-28 用户截图报「余额查询失败: unsupported provider: kimi」。
+  // 面板挂载时无条件调 credits.status / credits.balances，kimi 必须有分支。
+  // 与 codearts/trae/cline/loomy 的「无独立状态端点」同款：status 恒 null。
+  const caseStart = packSrc.indexOf('case "credits.status":')
+  const caseEnd = packSrc.indexOf('case "credits.claimAll":')
+  const body = packSrc.slice(caseStart, caseEnd)
+  const kimiIdx = body.indexOf('req.provider === KIMI.id')
+  assert.ok(kimiIdx > 0, 'credits.status 缺 kimi 分支')
+  const badIdx = body.indexOf('unsupported provider: ${req.provider}')
+  assert.ok(kimiIdx < badIdx, 'kimi 分支必须在 unsupported 之前')
+  assert.match(body.slice(kimiIdx, badIdx), /status: null/)
+})
+
+check('★ credits.balances：kimi 提前返回 balance:null（不报错）', () => {
+  const caseStart = packSrc.indexOf('case "credits.balances":')
+  const caseEnd = packSrc.indexOf('case "cline.quota":')
+  const body = packSrc.slice(caseStart, caseEnd)
+  const kimiIdx = body.indexOf('req.provider === KIMI.id')
+  assert.ok(kimiIdx > 0, 'credits.balances 缺 kimi 分支')
+  const badIdx = body.indexOf('unsupported provider: ${req.provider}')
+  assert.ok(kimiIdx < badIdx, 'kimi 分支必须在 unsupported 之前')
+  assert.match(body.slice(kimiIdx, badIdx), /balance: null/)
+})
+
+check('★ credits.claimAll：kimi 返回空 summary（点领取不报错）', () => {
+  const caseStart = packSrc.indexOf('case "credits.claimAll":')
+  const caseEnd = packSrc.indexOf('case "credits.balances":')
+  const body = packSrc.slice(caseStart, caseEnd)
+  const kimiIdx = body.indexOf('req.provider === KIMI.id')
+  assert.ok(kimiIdx > 0, 'credits.claimAll 缺 kimi 分支')
+  const badIdx = body.indexOf('unsupported provider: ${req.provider}')
+  assert.ok(kimiIdx < badIdx, 'kimi 分支必须在 unsupported 之前')
+  assert.match(body.slice(kimiIdx, badIdx), /claimed: 0/)
+})
+
+check('★ 三个 credits RPC 的 kimi 分支都齐全（面板挂载不报错）', () => {
+  for (const c of ['credits.status', 'credits.balances', 'credits.claimAll']) {
+    const caseStart = packSrc.indexOf(`case "${c}":`)
+    const nextCase = packSrc.indexOf('case "', caseStart + 10)
+    const body = packSrc.slice(caseStart, nextCase)
+    assert.match(body, /req\.provider === KIMI\.id/, `${c} 缺 kimi 分支`)
+  }
+})
+
 check('client 会展示 userCode（device flow 需要用户手输/直达链接）', () => {
   // login state 要带 userCode 与 urlComplete
   assert.match(clientSrc, /userCode: typeof value\?\.userCode === 'string'/)
