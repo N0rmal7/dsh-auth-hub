@@ -62643,6 +62643,25 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
           }
         };
       }
+      // ── 渠道平台清单（动态发现）──
+      //
+      // 为什么要有这个 RPC：客户端把渠道清单硬编码成 13 项数组，导致
+      // 「已注册的 provider」与「界面上能看到的渠道」是两套事实，加一个渠道
+      // 必须同时改 host 与 client 两处，漏一处就静默不显示。
+      //
+      // 这里以 `modelAdapters` 为**唯一事实源**：它就是这个 pack 真正注册进
+      // `ctx.llm` 的 provider 集合（codearts/buddy/workbuddy/.../opencode）。
+      // 客户端拿它渲染，就不再需要自己维护一份。
+      //
+      // 注意：`modelAdapters` 只含**账号池渠道**，不含 `llm-pi-ai` 那类纯 API Key
+      // provider（qwen / src / freetoken …）——那些没有账号、没有签到、没有余额，
+      // 放进「渠道账号」面板只会得到空壳卡片。
+      case "platform.list": {
+        const ids = Object.keys(modelAdapters ?? {});
+        // 标签/提示词由客户端提供（它有本地化文案），host 只负责给「有哪些」。
+        // 这样加渠道时不必在 host 里再抄一遍中文。
+        return { ok: true, value: { providers: ids } };
+      }
       // ── 模型列表可见性（黑名单开关）──
       //
       // 列表来自 `ctx.llm.listModels()`——**适配器播报的权威目录**，正是

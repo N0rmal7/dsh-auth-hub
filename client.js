@@ -6,7 +6,7 @@
  * 状态 chip、胶囊按钮，颜色全部取自 DSH 主题变量（`--dsw-alias-*`）。
  *
  * 四个分区：
- *   1. 渠道账号 —— 13 个渠道的账号 / 余额 / 签到状态（**折叠状态就显示**），可登录、
+ *   1. 渠道账号 —— 内置渠道的账号 / 余额 / 签到状态（**折叠状态就显示**，数量由 host 动态下发），可登录、
  *      领取、续期、停用、删除；可开「自动补签」。
  *   2. 签到渠道 —— **自己加的**每日签到站点（粘 Cookie / 粘 cURL 即可），自动签到
  *      并把奖励记进同一个积分台账。
@@ -17,7 +17,7 @@
  *   5. WorkBuddy —— 国内版 / 国际版。
  *
  * 数据与动作都**不复制**后端逻辑：
- *   - 13 个渠道：宿主 connection 的 RPC `/api/channel-pack`（方法名与它自己的
+ *   - 内置渠道：宿主 connection 的 RPC `/api/channel-pack`（方法名与它自己的
  *     界面一致：account.* / login.poll / credits.status / credits.balances /
  *     credits.claimAll / usage.autoCheckin / model.list）。
  *   - 积分上限与余额采样：本插件自己的 `/plugins/dsh-auth-hub/{policy,credit-sample}`。
@@ -38,22 +38,66 @@ window.__ModuleLoader__.load({
     const { createElement: h, Fragment, useState, useEffect, useMemo, useRef, useCallback } = React
 
     //#region 平台注册表
-    /** dsh-our-free-model 的 13 个账号渠道（`provider` 原样透传给 channel-pack）。 */
-    const CHANNEL_PLATFORMS = [
-      { provider: 'workbuddy', label: 'WorkBuddy 渠道', hint: '浏览器授权登录' },
-      { provider: 'buddy', label: 'CodeBuddy', hint: '浏览器授权登录' },
-      { provider: 'codearts', label: '华为 CodeArts', hint: '浏览器授权登录（AK/SK）' },
-      { provider: 'qoder', label: 'Qoder 国际版', hint: '浏览器授权登录' },
-      { provider: 'qodercn', label: 'Qoder 国内版', hint: '浏览器授权登录 · 每日 10:00 刷新' },
-      { provider: 'trae', label: 'TRAE', hint: '浏览器授权登录' },
-      { provider: 'cline', label: 'Cline', hint: '设备码轮询' },
-      { provider: 'lobsterai', label: '有道 LobsterAI', hint: '扫码 / 短信' },
-      { provider: 'loomy', label: '讯飞 Loomy', hint: '扫码 / 短信' },
-      { provider: 'raccoon', label: '商汤 Raccoon', hint: '浏览器授权登录' },
-      { provider: 'minimax', label: 'MiniMax', hint: '浏览器授权登录' },
-      { provider: 'zcode', label: 'ZCode / Z.ai', hint: '需要过验证码' },
-      { provider: 'gemini', label: 'Gemini', hint: '浏览器授权登录' },
-    ]
+    /**
+     * 渠道外观（label / hint）的**字典**，不是清单。
+     *
+     * 历史：这里原本是写死的 13 项数组，导致「host 注册了哪些 provider」与
+     * 「界面能显示哪些」是两套事实 —— 加渠道必须同时改 host 与 client，
+     * 漏一处就静默不显示（opencode 就是这样被漏掉的）。
+     *
+     * 现在改成「字典 + 运行时发现」：
+     *   · 有哪些渠道 → 问 host（`platform.list`，源自 `modelAdapters`，唯一事实源）
+     *   · 长什么样   → 查本字典；查不到的用 `fallbackPlatform()` 兜底
+     *
+     * 所以新增一个渠道时，**只需在 host 侧注册 adapter**；本字典是可选的
+     * 美化项（不写也能显示，只是 label 用 provider id）。
+     */
+    const PLATFORM_APPEARANCE = {
+      workbuddy: { label: 'WorkBuddy 渠道', hint: '浏览器授权登录' },
+      buddy: { label: 'CodeBuddy', hint: '浏览器授权登录' },
+      codearts: { label: '华为 CodeArts', hint: '浏览器授权登录（AK/SK）' },
+      qoder: { label: 'Qoder 国际版', hint: '浏览器授权登录' },
+      qodercn: { label: 'Qoder 国内版', hint: '浏览器授权登录 · 每日 10:00 刷新' },
+      trae: { label: 'TRAE', hint: '浏览器授权登录' },
+      cline: { label: 'Cline', hint: '设备码轮询' },
+      lobsterai: { label: '有道 LobsterAI', hint: '扫码 / 短信' },
+      loomy: { label: '讯飞 Loomy', hint: '扫码 / 短信' },
+      raccoon: { label: '商汤 Raccoon', hint: '浏览器授权登录' },
+      minimax: { label: 'MiniMax', hint: '浏览器授权登录' },
+      zcode: { label: 'ZCode / Z.ai', hint: '需要过验证码' },
+      gemini: { label: 'Gemini', hint: '浏览器授权登录' },
+      opencode: { label: 'OpenCode', hint: '免费档（常被限流）' },
+    }
+
+    /**
+     * 未在字典里的 provider 的兜底外观。
+     *
+     * 之所以要兜底而不是丢弃：第三方渠道插件（Kimi Code / Command Code /
+     * SuperGrok …）注册到 `ctx.llm` 后本插件就能给它们做轮换与积分上限，
+     * 但它们的名字本插件不认识。丢弃等于「装了也用不上」。
+     */
+    const fallbackPlatform = provider => ({
+      provider,
+      label: provider.charAt(0).toUpperCase() + provider.slice(1),
+      hint: '第三方渠道（由其它插件注册）',
+      unknown: true,
+    })
+
+    /** 把 host 给的 provider id 列表套上外观。顺序以 host 为准（注册顺序）。 */
+    const buildPlatforms = providers => (Array.isArray(providers) ? providers : [])
+      .filter(provider => typeof provider === 'string' && provider !== '')
+      .map(provider => (PLATFORM_APPEARANCE[provider] !== undefined
+        ? { provider, ...PLATFORM_APPEARANCE[provider] }
+        : fallbackPlatform(provider)))
+
+    /**
+     * 兜底清单：仅当 `platform.list` 取不到时用（旧版 host / RPC 未就绪）。
+     * 必须与 host 侧的 `modelAdapters` 键保持一致，否则会显示不存在的渠道。
+     */
+    const FALLBACK_PLATFORMS = buildPlatforms([
+      'workbuddy', 'buddy', 'codearts', 'qoder', 'qodercn', 'trae',
+      'cline', 'lobsterai', 'loomy', 'raccoon', 'minimax', 'zcode', 'gemini',
+    ])
 
     /**
      * WorkBuddy 两态：国际版走 www.workbuddy.ai，国内版与 CodeBuddy 共用
@@ -726,7 +770,7 @@ window.__ModuleLoader__.load({
     /**
      * 「签到渠道」分区。
      *
-     * 与上面 13 个渠道的本质区别：那些是**内置**的（登录协议写在 pack 里），这些是
+     * 与上面内置渠道的本质区别：那些是**内置**的（登录协议写在 pack 里），这些是
      * **用户自己加的**（一条 HTTP 模板 + 规则）。所以这里提供三种上手方式，按省事
      * 程度排序：
      *
@@ -2335,7 +2379,7 @@ window.__ModuleLoader__.load({
 
     //#region 账号中心主体
     /**
-     * 数据层：一次把 13 个渠道的「账号 / 签到状态 / 余额」拉回来。
+     * 数据层：一次把全部已发现渠道的「账号 / 签到状态 / 余额」拉回来。
      *
      * 不再等用户展开卡片 —— 折叠状态就要看到「N 个账号 · 余额 X · 今日已签」。
      * 并发上限 3：13 平台 × 3 接口 = 39 次调用，全并发会同时打出几十个上游请求
@@ -2363,6 +2407,13 @@ window.__ModuleLoader__.load({
        *    —— 那个错误会让整个分区渲染失败、页面一片空白（实测踩过）。
        */
       const [controlKey, setControlKey] = useState('')
+      /**
+       * 渠道清单：由 host 的 `platform.list` 下发（源自 `modelAdapters`，唯一事实源）。
+       *
+       * 初值是兜底清单（RPC 未就绪 / 旧版 host 时的可读降级），拿到 host 结果后覆盖。
+       * 这样「新增渠道」只需在 host 注册 adapter，界面自动跟随，不必再改本文件。
+       */
+      const [platforms, setPlatforms] = useState(FALLBACK_PLATFORMS)
       const claimedRef = useRef(new Set())
       const claimQueueRef = useRef(Promise.resolve())
 
@@ -2374,6 +2425,24 @@ window.__ModuleLoader__.load({
           .catch(() => { /* Host 半身没加载时保持空串，写操作会给出可读错误 */ })
         return () => { alive = false }
       }, [])
+
+      /**
+       * 问 host「现在装了哪些渠道」。
+       *
+       * 失败时**保持兜底清单**而不是清空 —— 宁可少显示，也不能让整页变空。
+       */
+      useEffect(() => {
+        if (!channelAvailable) return undefined
+        let alive = true
+        void rpc('platform.list', {}, 15_000)
+          .then(value => {
+            if (!alive) return
+            const discovered = buildPlatforms(value?.providers)
+            if (discovered.length > 0) setPlatforms(discovered)
+          })
+          .catch(() => { /* 老 host 没这个 RPC：静默保留兜底 */ })
+        return () => { alive = false }
+      }, [channelAvailable, rpc])
 
       const reportError = useCallback((scope, caught) => {
         const actual = caught === undefined ? scope : caught
@@ -2436,7 +2505,7 @@ window.__ModuleLoader__.load({
       const refreshAll = useCallback(async force => {
         if (!channelAvailable) return
         setError('')
-        const list = CHANNEL_PLATFORMS.map(platform => platform.provider)
+        const list = platforms.map(platform => platform.provider)
         let cursor = 0
         const workers = Array.from({ length: Math.min(LOAD_CONCURRENCY, list.length) }, async () => {
           while (cursor < list.length) {
@@ -2451,7 +2520,7 @@ window.__ModuleLoader__.load({
         await Promise.all(workers)
         setUpdatedAt(Date.now())
         // 账号渠道的模型目录随「全部刷新」一起重读（逐 provider 的 model.list）。
-      }, [channelAvailable, loadProvider, scheduleAutoClaim, reportError])
+      }, [channelAvailable, platforms, loadProvider, scheduleAutoClaim, reportError])
 
 
       const loadAutoCheckin = useCallback(async () => {
@@ -2493,12 +2562,12 @@ window.__ModuleLoader__.load({
         return text
       }, [claimProvider, loadProvider])
 
-      const pendingClaims = CHANNEL_PLATFORMS
+      const pendingClaims = platforms
         .filter(platform => (providers ?? {})[platform.provider]?.status?.active === true && (providers ?? {})[platform.provider]?.status?.todayCheckedIn !== true)
         .map(platform => platform.label)
 
       const channelsBody = channelAvailable
-        ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } }, CHANNEL_PLATFORMS.map(platform => h(ChannelPlatformCard, {
+        ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } }, platforms.map(platform => h(ChannelPlatformCard, {
           key: platform.provider,
           platform,
           rpc,
@@ -2520,7 +2589,7 @@ window.__ModuleLoader__.load({
           onError: reportError,
         })))
       const tabs = [
-        { id: 'channels', label: `渠道账号（${CHANNEL_PLATFORMS.length}）` },
+        { id: 'channels', label: `渠道账号（${platforms.length}）` },
         { id: 'checkin', label: '签到渠道' },
         { id: 'models', label: '按模型' },
         { id: 'credits', label: '积分上限' },
@@ -2536,7 +2605,7 @@ window.__ModuleLoader__.load({
         }, [
           h('span', { key: 'text', style: headTextStyle }, [
             h('span', { key: 'name', style: nameStyle }, '账号中心'),
-            h('span', { key: 'desc', style: descriptionStyle }, '13 个渠道账号 + WorkBuddy 的登录、余额、签到；自己加的签到渠道；按模型看账号；组合轮换与每日限量'),
+            h('span', { key: 'desc', style: descriptionStyle }, `${platforms.length} 个渠道账号 + WorkBuddy 的登录、余额、签到；自己加的签到渠道；按模型看账号；组合轮换与每日限量`),
           ]),
           h(ChevronDownOutline14, { key: 'chev', open }),
         ]),
@@ -2570,12 +2639,12 @@ window.__ModuleLoader__.load({
             tab === 'checkin' ? h(CheckinTab, { controlKey, onError: reportError }) : null,
             tab === 'models' ? h(AccountModelTab, {
               rpc,
-              platforms: CHANNEL_PLATFORMS,
+              platforms,
               providers,
               onError: reportError,
             }) : null,
             tab === 'credits' ? h(CreditCapTab, {
-              platforms: CHANNEL_PLATFORMS,
+              platforms,
               providers,
               onError: reportError,
             }) : null,

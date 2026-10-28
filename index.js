@@ -2,11 +2,11 @@
  * DSH 账号中心 —— Host 半身。
  *
  * 现在**自己就是账号渠道的宿主**：内置 `vendor/channel-pack/pack.js`（原属
- * `dsh-our-free-model`，13 个渠道的登录 / 账号池 / 积分领取），所以不再需要装
+ * `dsh-our-free-model`，内置渠道的登录 / 账号池 / 积分领取），所以不再需要装
  * 那个插件。WorkBuddy 的双区登录也走内置 pack。
  *
  * v0.4.0 起还多了一层**自己加的签到渠道**（`checkin-channels.js` +
- * `checkin-runner.js`）：内置那 13 个渠道必须逆向登录协议才能加，而「每日签到」
+ * `checkin-runner.js`）：内置渠道必须逆向登录协议才能加，而「每日签到」
  * 这件事只是一发 HTTP + JSON 判成败，所以它被做成了声明式配置——粘一条 cURL
  * 就能接一个新站点，每天自动签、奖励进同一个积分台账。
  *
