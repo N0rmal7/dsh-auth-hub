@@ -72,11 +72,19 @@ check('host 返回空清单时 client 不崩（保留兜底逻辑在上层）', 
 
 console.log('\n=== 2. host 侧：改 modelAdapters 就等于改清单 ===')
 
-check('platform.list 直接反映 modelAdapters 的键（无二次过滤）', () => {
+check('platform.list 用 providerIdsOf 而非裸 Object.keys（第三方可见）', () => {
   const s = packSrc.indexOf('case "platform.list":')
   const block = packSrc.slice(s, packSrc.indexOf('case "model.list":'))
-  assert.match(block, /Object\.keys\(modelAdapters/, '必须直接取 modelAdapters 的键')
-  assert.doesNotMatch(block, /filter\(|includes\(|ALL_PRODUCTS/, '不应再有额外白名单过滤')
+  assert.match(block, /providerIdsOf/, '必须复用 providerIdsOf（优先 llm.listProviders）')
+  assert.match(block, /const pool = Object\.keys\(modelAdapters/, '账号池渠道仍以 modelAdapters 为准')
+  assert.match(block, /others/, '必须区分出第三方 provider')
+})
+
+check('platform.list 返回 pool 与 others 两类（不混为一个数组）', () => {
+  const s = packSrc.indexOf('case "platform.list":')
+  const block = packSrc.slice(s, packSrc.indexOf('case "model.list":'))
+  assert.match(block, /value:\s*\{\s*providers:\s*pool,\s*pool,\s*others\s*\}/,
+    '返回结构应为 { providers, pool, others }')
 })
 
 check('新增渠道只需在 modelAdapters 加一行（无其它同步点）', () => {

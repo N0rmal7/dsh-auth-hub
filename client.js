@@ -2414,6 +2414,14 @@ window.__ModuleLoader__.load({
        * 这样「新增渠道」只需在 host 注册 adapter，界面自动跟随，不必再改本文件。
        */
       const [platforms, setPlatforms] = useState(FALLBACK_PLATFORMS)
+      /**
+       * 同进程里**其它插件**注册到 `ctx.llm` 的 provider（无本插件账号池）。
+       *
+       * 它们不进「渠道账号」卡片（没有登录/签到/余额可看），但会作为
+       * **轮换候选**出现在「按模型」页 —— 轮换引擎本来就是 provider-agnostic 的，
+       * 这样「装了第三方 provider 插件」才真的用得上。
+       */
+      const [externalPlatforms, setExternalPlatforms] = useState([])
       const claimedRef = useRef(new Set())
       const claimQueueRef = useRef(Promise.resolve())
 
@@ -2437,8 +2445,14 @@ window.__ModuleLoader__.load({
         void rpc('platform.list', {}, 15_000)
           .then(value => {
             if (!alive) return
-            const discovered = buildPlatforms(value?.providers)
+            // host 分两类返回：pool = 本插件账号池渠道（完整卡片），
+            // others = 其它插件注册到 ctx.llm 的 provider（只进轮换候选）。
+            // providers 是向后兼容用的合并视图。
+            const pool = Array.isArray(value?.pool) ? value.pool : value?.providers
+            const discovered = buildPlatforms(pool)
             if (discovered.length > 0) setPlatforms(discovered)
+            const extra = buildPlatforms(value?.others).filter(p => !discovered.some(d => d.provider === p.provider))
+            setExternalPlatforms(extra)
           })
           .catch(() => { /* 老 host 没这个 RPC：静默保留兜底 */ })
         return () => { alive = false }
@@ -2639,7 +2653,8 @@ window.__ModuleLoader__.load({
             tab === 'checkin' ? h(CheckinTab, { controlKey, onError: reportError }) : null,
             tab === 'models' ? h(AccountModelTab, {
               rpc,
-              platforms,
+              // 轮换候选 = 账号池渠道 + 第三方 provider（后者无账号但可轮换）
+              platforms: [...platforms, ...externalPlatforms],
               providers,
               onError: reportError,
             }) : null,

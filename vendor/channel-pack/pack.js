@@ -62657,10 +62657,35 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
       // provider（qwen / src / freetoken …）——那些没有账号、没有签到、没有余额，
       // 放进「渠道账号」面板只会得到空壳卡片。
       case "platform.list": {
-        const ids = Object.keys(modelAdapters ?? {});
+        // 分两类返回，别混成一个数组：
+        //
+        //   pool    —— 本 pack 自己注册的账号池渠道（有登录 / 账号 / 签到 / 余额），
+        //              渲染成完整卡片。
+        //   others  —— 同进程里**其它插件**注册到 `ctx.llm` 的 provider。
+        //              它们没有本插件的账号池，但**可以进轮换组**（rotation.js 是
+        //              provider-agnostic 的：parseMember 不校验 provider、
+        //              memberExhausted 对未知 provider 直接放行）。
+        //              所以要让前端看得见 —— 否则「装了第三方 provider 插件
+        //              也用不上」，client.js 里那段承诺就是空话。
+        //
+        // 为什么用 providerIdsOf 而不是直接 Object.keys(modelAdapters)：
+        // 前者优先读 `llm.listProviders()`（进程内全部 provider），失败才退回
+        // modelAdapters —— 与 `models.*` 路由用的是同一份判据（见 63064）。
+        const pool = Object.keys(modelAdapters ?? {});
+        let others = [];
+        try {
+          const all = providerIdsOf(llmServiceOf(ctx), modelAdapters) ?? [];
+          const poolSet = new Set(pool);
+          others = all
+            .map((entry) => (typeof entry === "string" ? entry : entry?.id))
+            .filter((id) => typeof id === "string" && id.length > 0 && !poolSet.has(id));
+        } catch {
+          // 取不到进程 provider 列表时不影响主路径：pool 仍然可用。
+          others = [];
+        }
         // 标签/提示词由客户端提供（它有本地化文案），host 只负责给「有哪些」。
         // 这样加渠道时不必在 host 里再抄一遍中文。
-        return { ok: true, value: { providers: ids } };
+        return { ok: true, value: { providers: pool, pool, others } };
       }
       // ── 模型列表可见性（黑名单开关）──
       //

@@ -146,7 +146,19 @@ check('client.js 已无 CHANNEL_PLATFORMS 残留', () => {
 
 check('平台清单从 state 读取（platforms），不是常量', () => {
   assert.match(clientSrc, /const \[platforms, setPlatforms\] = useState\(FALLBACK_PLATFORMS\)/)
-  assert.match(clientSrc, /buildPlatforms\(value\?\.providers\)/)
+  assert.match(clientSrc, /buildPlatforms\(pool\)/)
+})
+
+check('第三方 provider 单独存 externalPlatforms（不进渠道卡片）', () => {
+  assert.match(clientSrc, /const \[externalPlatforms, setExternalPlatforms\] = useState\(\[\]\)/)
+  assert.match(clientSrc, /setExternalPlatforms\(extra\)/)
+})
+
+check('第三方 provider 会进轮换候选（按模型页）', () => {
+  const s = clientSrc.indexOf("tab === 'models'")
+  const block = clientSrc.slice(s, s + 400)
+  assert.match(block, /\[\.\.\.platforms, \.\.\.externalPlatforms\]/,
+    '轮换候选应合并账号池渠道与第三方 provider')
 })
 
 check('RPC 失败时保留兜底清单（不清空页面）', () => {
