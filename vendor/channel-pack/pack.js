@@ -61315,6 +61315,34 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
             });
           });
           return { ok: true, value: { accountId: id, loginUrl: started.loginUrl } };
+        } else if (provider === KIMI.id) {
+          // Kimi Code：OAuth 2.0 Device Authorization Grant（RFC 8628）。
+          // 与 cline 同形：startLogin 立即返回 { loginUrl, userCode, result }，
+          // 用户在浏览器完成授权后 result resolve，凭据落 ref、账号登记进池。
+          const started = await kimi.startLogin({ refName });
+          await pool.addAccount({
+            id,
+            provider: KIMI.id,
+            nickname: id,
+            enabled: true,
+            credentialRef: refName,
+            refreshable: false,
+            createdAt: Date.now()
+          });
+          started.result.then(async (loginResult) => {
+            const credential = parseKimiCredential(loginResult.access);
+            await pool.updateAccount(id, {
+              nickname: credential?.nickname !== void 0 && credential.nickname.length > 0 ? credential.nickname : id,
+              expiresAt: credential !== void 0 ? kimiCredentialExpiresAtMs(credential) : void 0,
+              refreshable: credential !== void 0 && isKimiRefreshable(credential)
+            });
+          }).catch((error) => {
+            ctx.logger.warn(`[channel-pack] background ${KIMI.id} login failed for ${id}: ${String(error)}`);
+            void pool.removeAccount(id).catch(() => {
+            });
+          });
+          // userCode 一起下发：device flow 需要用户在浏览器里输入这串码。
+          return { ok: true, value: { accountId: id, loginUrl: started.loginUrl, userCode: started.userCode } };
         } else if (provider === LOOMY.id) {
           await pool.addAccount({
             id,
@@ -68243,6 +68271,1289 @@ function registerOpencodeLlm(ctx, options) {
   return adapter;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Kimi Code 渠道（OAuth 2.0 Device Authorization Grant / RFC 8628）
+//
+// 【源码出处 —— 每条 wire fact 都能追溯到官方实现，无一处猜测】
+//
+// 1) 官方 CLI（Apache-2.0）：github.com/MoonshotAI/kimi-cli
+//    · src/kimi_cli/auth/oauth.py:50
+//        KIMI_CODE_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098"
+//    · src/kimi_cli/auth/oauth.py:51
+//        DEFAULT_OAUTH_HOST = "https://auth.kimi.com"
+//    · src/kimi_cli/auth/oauth.py:454-472  request_device_authorization()
+//        POST {host}/api/oauth/device_authorization   body: client_id
+//        → user_code / device_code / verification_uri / verification_uri_complete
+//          / expires_in / interval
+//    · src/kimi_cli/auth/oauth.py:476-500  _request_device_token()
+//        POST {host}/api/oauth/token
+//        body: client_id, device_code,
+//              grant_type=urn:ietf:params:oauth:grant-type:device_code
+//    · src/kimi_cli/auth/oauth.py:503-520  refresh_token()
+//        POST {host}/api/oauth/token
+//        body: client_id, grant_type=refresh_token, refresh_token
+//        → 401/403 视为凭证终态
+//    · src/kimi_cli/auth/oauth.py:250-261  _common_headers()
+//        X-Msh-Platform / X-Msh-Version / X-Msh-Device-Name /
+//        X-Msh-Device-Model / X-Msh-Os-Version / X-Msh-Device-Id
+//    · src/kimi_cli/auth/platforms.py:53-56  _kimi_code_base_url()
+//        "https://api.kimi.com/coding/v1"
+//    · packages/kosong/src/kosong/chat_provider/kimi.py:174-184
+//        chat 走 OpenAI 兼容 chat.completions（不是 /responses）
+//    · packages/kosong/src/kosong/chat_provider/kimi.py:214-222  with_thinking()
+//        extra_body.thinking = {type: "enabled"|"disabled"}
+//    · klips/klip-14-kimi-code-oauth-login.md:36-54 协议正式说明
+//        「OAuth 流程基于 Device Authorization Grant」、「不需要 client secret」
+//
+// 2) 交叉验证（MIT）：github.com/EricFL1998/dsh-subscription-oauth
+//    src/constants.ts:16,19,22 / src/auth/device-flow.ts:306,351,399
+//    同一 client_id、同一组端点、同一组 X-Msh-* 头，独立实现但完全一致。
+//
+// 所以 Kimi **不是** PKCE、**不是** 网页 cookie —— 是标准 device flow，
+// 与 cline 的 WorkOS device flow 同形（但域名、路径、头、token 语义全不同，
+// 故不复用 CLINE_* 任何常量）。
+// ─────────────────────────────────────────────────────────────────────────────
+var KIMI_CLIENT_ID = "17e5f671-d194-4dfb-9706-5516cb48c098";
+var KIMI_OAUTH_HOST = "https://auth.kimi.com";
+var KIMI_DEVICE_AUTHORIZATION_PATH = "/api/oauth/device_authorization";
+var KIMI_TOKEN_PATH = "/api/oauth/token";
+var KIMI_DEVICE_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:device_code";
+/** Kimi Code CLI 的版本号，用于 `X-Msh-Version` / `User-Agent`。 */
+var KIMI_CLI_VERSION = "0.14.0";
+/** RFC 8628 §3.5：每次 `slow_down` 固定退避增量。 */
+var KIMI_SLOW_DOWN_INCREMENT_MS = 5e3;
+/** device_code 的兜底有效期（上游未给 `expires_in` 时）。 */
+var KIMI_DEVICE_AUTH_EXPIRES_MS = 15 * 60 * 1e3;
+/** 轮询间隔兜底（上游未给 `interval` 时；官方 CLI 同值）。 */
+var KIMI_DEVICE_AUTH_INTERVAL_MS = 5e3;
+var KIMI_HTTP_TIMEOUT_MS = 3e4;
+/** 连续网络失败上限：超过即判定登录服务不可达（与 cline 同口径）。 */
+var KIMI_POLL_MAX_FAILURES = 5;
+var KIMI_DEFAULT_MODEL = "kimi-for-coding";
+var KIMI_DEFAULT_MAX_TOKENS = 32e3;
+var KIMI_CONTEXT_WINDOW = 262144;
+/**
+ * 思考强度阶梯。
+ *
+ * 出处：官方 `with_thinking()` 只区分 enabled/disabled（`thinking.type`），
+ * 而 `thinking.effort` 是 Moonshot 的既有字段（见 EricFL1998 实现读到的
+ * `think_efforts.valid_efforts`：low/high/max）。这里对 harness 的
+ * none/low/medium/high/max 做一次映射，medium 归并到 high（上游无 medium 档，
+ * 与该实现的 EFFORT_WIRE_MAP 一致）。
+ */
+var KIMI_REASONING_EFFORTS = [
+  { id: "none", name: "Off" },
+  { id: "low", name: "Low" },
+  { id: "medium", name: "Medium" },
+  { id: "high", name: "High" },
+  { id: "max", name: "Max" }
+];
+var KIMI_DEFAULT_REASONING_EFFORT = "high";
+/** harness effort id → 上游 `thinking.effort` 取值。 */
+var KIMI_EFFORT_WIRE_MAP = {
+  none: "none",
+  low: "low",
+  medium: "high",
+  high: "high",
+  max: "max"
+};
+/**
+ * 兜底模型目录。
+ *
+ * 出处：EricFL1998/dsh-subscription-oauth 的 `tools/live-kimi-models.json`
+ * （该仓库实测 `/models` 的响应快照）：
+ *   · kimi-for-coding          context 1048576, text/image/video, efforts low/high/max
+ *   · kimi-for-coding-highspeed context 262144, 无 effort 阶梯
+ *   · k3                       context 1048576, efforts low/high/max (default high)
+ *   · k3-256k                  context 262144, 无 video
+ * 冷启动时用这张表，登录后由 `/models` 覆盖。
+ */
+var KIMI_FALLBACK_MODELS = [
+  {
+    id: "kimi-for-coding",
+    name: "Kimi for Coding",
+    contextWindow: 1048576,
+    maxTokens: 32e3,
+    supportsImage: true
+  },
+  {
+    id: "kimi-for-coding-highspeed",
+    name: "Kimi for Coding Highspeed",
+    contextWindow: 262144,
+    maxTokens: 32e3,
+    supportsImage: true
+  },
+  {
+    id: "k3",
+    name: "Kimi K3",
+    contextWindow: 1048576,
+    maxTokens: 32e3,
+    supportsImage: true
+  },
+  {
+    id: "k3-256k",
+    name: "Kimi K3 (256K)",
+    contextWindow: 262144,
+    maxTokens: 32e3,
+    supportsImage: true
+  }
+];
+var KIMI = {
+  id: "kimi",
+  displayName: "Kimi Code",
+  apiBase: "https://api.kimi.com/coding/v1",
+  oauthHost: KIMI_OAUTH_HOST,
+  clientId: KIMI_CLIENT_ID,
+  chatPath: "/chat/completions",
+  modelsPath: "/models",
+  defaultCredentialRef: "KIMI_ACCESS_TOKEN",
+  fallbackModels: KIMI_FALLBACK_MODELS
+};
+var ALL_KIMI_PRODUCTS = [KIMI];
+function kimiProductById(id) {
+  return ALL_KIMI_PRODUCTS.find((product) => product.id === id);
+}
+
+// vendor/channel-pack/src/kimi-oauth.ts（本仓库实现，骨架参照 cline-oauth.ts）
+function kimiSleep(ms, signal) {
+  return new Promise((resolve2, reject) => {
+    if (signal?.aborted === true) {
+      reject(new Error("\u767B\u5F55\u5DF2\u53D6\u6D88"));
+      return;
+    }
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new Error("\u767B\u5F55\u5DF2\u53D6\u6D88"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve2();
+    }, ms);
+    timer.unref?.();
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+function kimiIsAborted(signal) {
+  return signal?.aborted === true;
+}
+var KIMI_SERVER_ERROR_PREFIX = "\u767B\u5F55\u670D\u52A1\u8FD4\u56DE\u5F02\u5E38";
+function kimiSecondsToMs(value, fallbackMs) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return fallbackMs;
+  return Math.floor(value) * 1e3;
+}
+/**
+ * 读一条字符串字段（空串当缺失）。
+ * @param {unknown} value 待判定值。
+ * @returns {string|undefined} 非空字符串，或 undefined。
+ */
+function kimiStringField(value) {
+  return typeof value === "string" && value.length > 0 ? value : void 0;
+}
+/**
+ * 把一个 JSON 值当作对象记录读取。
+ * @param {unknown} value 待判定值。
+ * @returns {Record<string, unknown>|undefined} 对象本身，或 undefined。
+ */
+function kimiRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value : void 0;
+}
+/**
+ * 解码 JWT 的 payload 段（Kimi 的 access_token 是 JWT）。
+ *
+ * 仅用于**展示**账号身份（账号卡片昵称 / id），从不用于任何授权判定 ——
+ * 签名一律由上游校验，本插件只读不验，读到的值只影响 UI 文案。
+ *
+ * @param {string|undefined} token JWT 字符串。
+ * @returns {Record<string, unknown>|undefined} payload 声明，或 undefined。
+ */
+function kimiJwtClaims(token) {
+  if (typeof token !== "string" || token.length === 0) return void 0;
+  const parts = token.split(".");
+  if (parts.length < 2) return void 0;
+  try {
+    const decoded = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
+    return kimiRecord(decoded);
+  } catch {
+    return void 0;
+  }
+}
+/**
+ * 从 token 里恢复账号身份。
+ *
+ * 出处：EricFL1998 `src/auth/device-flow.ts:166-181` 的 `identityFromTokens()`：
+ * `user_id` 优先于 `sub`，email 统一小写。
+ *
+ * @param {string|undefined} accessToken 访问令牌。
+ * @param {string|undefined} refreshToken 刷新令牌（兜底来源）。
+ * @returns {{accountId?: string, email?: string}}
+ */
+function kimiIdentityFromTokens(accessToken, refreshToken) {
+  const access = kimiJwtClaims(accessToken);
+  const refresh = kimiJwtClaims(refreshToken);
+  const accountId = kimiStringField(access?.user_id) ?? kimiStringField(refresh?.user_id) ?? kimiStringField(access?.sub) ?? kimiStringField(refresh?.sub);
+  const email = (kimiStringField(access?.email) ?? kimiStringField(refresh?.email))?.toLowerCase();
+  return {
+    ...accountId === void 0 ? {} : { accountId },
+    ...email === void 0 ? {} : { email }
+  };
+}
+/**
+ * 解析 token 端点响应。
+ *
+ * `expires_in` 必须是非负有限数：缺失或异常的寿命会让凭据被当成永久有效，
+ * 故此处直接抛错而不是静默取默认值。
+ *
+ * @param {unknown} payload token 端点 JSON。
+ * @param {string|undefined} previousRefreshToken 响应未带 refresh_token 时沿用。
+ * @returns {{accessToken: string, refreshToken?: string, expiresAt: number}}
+ */
+function parseKimiTokenPayload(payload, previousRefreshToken) {
+  const record = kimiRecord(payload) ?? {};
+  const accessToken = kimiStringField(record.access_token);
+  const lifetime = record.expires_in;
+  const lifetimeOk = typeof lifetime === "number" && Number.isFinite(lifetime) && lifetime >= 0;
+  const refreshToken = kimiStringField(record.refresh_token) ?? previousRefreshToken;
+  if (accessToken === void 0 || !lifetimeOk) {
+    throw new Error("Kimi token \u54CD\u5E94\u7F3A\u5C11\u5FC5\u8981\u5B57\u6BB5\uFF08access_token / expires_in\uFF09");
+  }
+  const expiresAt = Date.now() + lifetime * 1e3;
+  if (!Number.isFinite(expiresAt)) {
+    throw new Error("Kimi token \u54CD\u5E94\u7F3A\u5C11\u5FC5\u8981\u5B57\u6BB5\uFF08access_token / expires_in\uFF09");
+  }
+  return {
+    accessToken,
+    ...refreshToken === void 0 ? {} : { refreshToken },
+    expiresAt
+  };
+}
+/**
+ * 读本机 identity 信息。
+ *
+ * 允许用 `DSH_KIMI_OS_INFO`（JSON）注入，便于离线测试固定设备头；
+ * 未注入时从 `process` 取可降级的近似值 —— 拿不到的字段退回占位串，
+ * 绝不让一次环境探测失败挡住登录。
+ *
+ * @returns {{hostname: string, platformName: string, release: string, arch: string}}
+ */
+function kimiOsInfo() {
+  if (typeof process.env.DSH_KIMI_OS_INFO === "string" && process.env.DSH_KIMI_OS_INFO.length > 0) {
+    try {
+      const record = kimiRecord(JSON.parse(process.env.DSH_KIMI_OS_INFO));
+      if (record !== void 0) {
+        return {
+          hostname: kimiStringField(record.hostname) ?? "unknown",
+          platformName: kimiStringField(record.platformName) ?? "unknown",
+          release: kimiStringField(record.release) ?? "unknown",
+          arch: kimiStringField(record.arch) ?? "unknown"
+        };
+      }
+    } catch {
+    }
+  }
+  return {
+    hostname: kimiStringField(process.env.COMPUTERNAME) ?? kimiStringField(process.env.HOSTNAME) ?? "unknown",
+    platformName: process.platform === "win32" ? "Windows" : process.platform === "darwin" ? "macOS" : process.platform === "linux" ? "Linux" : process.platform,
+    release: kimiStringField(process.env.OS) ?? process.version,
+    arch: process.arch
+  };
+}
+/**
+ * 设备身份头：官方 CLI 要求每个 OAuth 请求都带这一组 `X-Msh-*`。
+ *
+ * 出处：`src/kimi_cli/auth/oauth.py:250-261`。`X-Msh-Device-Id` 必须是**稳定**的
+ * 32 位十六进制串（服务端按它归并用量），故由调用方生成并持久化后传入。
+ *
+ * @param {string} deviceId 32 位小写十六进制设备 id。
+ * @returns {Record<string, string>} 请求头。
+ */
+function kimiIdentityHeaders(deviceId) {
+  const os2 = kimiOsInfo();
+  return {
+    "User-Agent": `KimiCLI/${KIMI_CLI_VERSION}`,
+    // 官方 CLI 用 `kimi_cli`；Kimi Code 客户端用 `kimi_code_cli`。
+    // 两者都被后端接受（两个独立 MIT 实现对同一后端都跑通），此处跟随官方 CLI。
+    "X-Msh-Platform": "kimi_cli",
+    "X-Msh-Version": KIMI_CLI_VERSION,
+    "X-Msh-Device-Name": os2.hostname,
+    "X-Msh-Device-Model": `${os2.platformName} ${os2.release} ${os2.arch}`,
+    "X-Msh-Os-Version": os2.release,
+    "X-Msh-Device-Id": deviceId
+  };
+}
+/**
+ * 申请 device_code。
+ *
+ * 端点与请求体见 `src/kimi_cli/auth/oauth.py:454-472`。
+ *
+ * @param {object} product 产品配置（需 `oauthHost` / `clientId`）。
+ * @param {{fetcher?: Function, deviceId?: string, signal?: AbortSignal}} options 传输与身份。
+ * @returns {Promise<{deviceCode: string, userCode: string, verificationUri: string, verificationUriComplete?: string, expiresInMs: number, intervalMs: number}>}
+ */
+async function requestKimiDeviceAuthorization(product, options = {}) {
+  const fetcher = options.fetcher ?? fetch;
+  const response = await fetcher(`${product.oauthHost}${KIMI_DEVICE_AUTHORIZATION_PATH}`, {
+    method: "POST",
+    headers: {
+      ...kimiIdentityHeaders(options.deviceId ?? ""),
+      Accept: "application/json",
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: new URLSearchParams({ client_id: product.clientId }).toString(),
+    signal: options.signal ?? AbortSignal.timeout(KIMI_HTTP_TIMEOUT_MS)
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const detail = kimiStringField(payload.error_description) !== void 0 ? ` - ${payload.error_description}` : "";
+    throw new Error(`${KIMI_SERVER_ERROR_PREFIX}\uFF1A\u8BBE\u5907\u7801\u6388\u6743\u5931\u8D25\uFF08HTTP ${response.status}\uFF09${detail}`);
+  }
+  const record = kimiRecord(payload) ?? {};
+  const deviceCode = kimiStringField(record.device_code) ?? "";
+  const userCode = kimiStringField(record.user_code) ?? "";
+  const verificationUri = kimiStringField(record.verification_uri) ?? "";
+  if (deviceCode.length === 0 || userCode.length === 0 || verificationUri.length === 0) {
+    throw new Error(`${KIMI_SERVER_ERROR_PREFIX}\uFF1A\u8BBE\u5907\u7801\u6388\u6743\u54CD\u5E94\u7F3A\u5C11\u5FC5\u8981\u5B57\u6BB5`);
+  }
+  const verificationUriComplete = kimiStringField(record.verification_uri_complete);
+  return {
+    deviceCode,
+    userCode,
+    verificationUri,
+    ...verificationUriComplete === void 0 ? {} : { verificationUriComplete },
+    // 上游给的是秒；`or 5` 的默认值见 oauth.py:472。
+    expiresInMs: kimiSecondsToMs(record.expires_in, KIMI_DEVICE_AUTH_EXPIRES_MS),
+    intervalMs: kimiSecondsToMs(record.interval, KIMI_DEVICE_AUTH_INTERVAL_MS)
+  };
+}
+/**
+ * 轮询 token 端点直到用户授权完成。
+ *
+ * 状态机（RFC 8628 §3.5 + `src/kimi_cli/auth/oauth.py:476-500`）：
+ *   · `authorization_pending` → 按 interval 继续
+ *   · `slow_down`             → interval += 5s 后继续
+ *   · `access_denied`         → 用户拒绝（终态）
+ *   · `expired_token`         → 设备码过期（终态）
+ *   · 其它 error              → 终态失败
+ *
+ * 成功判据是「拿到了 access_token」，不是 HTTP 2xx —— 错误体可能骑在 200 上
+ * （与 cline 的 pollClineWorkOsTokens 同口径）。
+ *
+ * @param {object} authorization `requestKimiDeviceAuthorization` 的返回值。
+ * @param {{product: object, fetcher?: Function, deviceId?: string, signal?: AbortSignal, timeoutMs?: number, pollIntervalMs?: number}} options 轮询参数。
+ * @returns {Promise<{accessToken: string, refreshToken?: string, expiresAt: number}>}
+ */
+async function pollKimiDeviceToken(authorization, options) {
+  const fetcher = options.fetcher ?? fetch;
+  const deadline = Date.now() + (options.timeoutMs ?? authorization.expiresInMs);
+  let intervalMs = Math.max(1e3, options.pollIntervalMs ?? authorization.intervalMs);
+  let failures = 0;
+  while (Date.now() <= deadline) {
+    if (kimiIsAborted(options.signal)) throw new Error("\u767B\u5F55\u5DF2\u53D6\u6D88");
+    await kimiSleep(intervalMs, options.signal);
+    if (kimiIsAborted(options.signal)) throw new Error("\u767B\u5F55\u5DF2\u53D6\u6D88");
+    try {
+      const response = await fetcher(`${options.product.oauthHost}${KIMI_TOKEN_PATH}`, {
+        method: "POST",
+        headers: {
+          ...kimiIdentityHeaders(options.deviceId ?? ""),
+          Accept: "application/json",
+          "Content-Type": "application/x-www-form-urlencoded"
+        },
+        body: new URLSearchParams({
+          client_id: options.product.clientId,
+          device_code: authorization.deviceCode,
+          grant_type: KIMI_DEVICE_GRANT_TYPE
+        }).toString(),
+        signal: options.signal ?? AbortSignal.timeout(KIMI_HTTP_TIMEOUT_MS)
+      });
+      const payload = await response.json().catch(() => ({}));
+      const record = kimiRecord(payload) ?? {};
+      failures = 0;
+      if (response.ok && kimiStringField(record.access_token) !== void 0) {
+        return parseKimiTokenPayload(payload);
+      }
+      const errorCode = kimiStringField(record.error);
+      if (errorCode === "authorization_pending") continue;
+      if (errorCode === "slow_down") {
+        intervalMs += KIMI_SLOW_DOWN_INCREMENT_MS;
+        continue;
+      }
+      if (errorCode === "access_denied") {
+        throw new Error(`${KIMI_SERVER_ERROR_PREFIX}\uFF1A\u7528\u6237\u5728\u6D4F\u89C8\u5668\u4E2D\u62D2\u7EDD\u4E86\u6388\u6743`);
+      }
+      if (errorCode === "expired_token") {
+        throw new Error(`${KIMI_SERVER_ERROR_PREFIX}\uFF1A\u8BBE\u5907\u7801\u5DF2\u8FC7\u671F\uFF0C\u8BF7\u91CD\u65B0\u53D1\u8D77\u767B\u5F55`);
+      }
+      const detail = kimiStringField(record.error_description);
+      throw new Error(
+        `${KIMI_SERVER_ERROR_PREFIX}\uFF1A${detail ?? `token \u8F6E\u8BE2\u5931\u8D25\uFF08HTTP ${response.status}\uFF09`}`
+      );
+    } catch (error) {
+      if (kimiIsAborted(options.signal)) throw new Error("\u767B\u5F55\u5DF2\u53D6\u6D88");
+      if (error instanceof Error && error.message.startsWith(KIMI_SERVER_ERROR_PREFIX)) throw error;
+      failures += 1;
+      if (failures >= KIMI_POLL_MAX_FAILURES) {
+        throw new Error(
+          `\u65E0\u6CD5\u8FDE\u63A5 Kimi \u767B\u5F55\u670D\u52A1\uFF08\u8FDE\u7EED ${failures} \u6B21\u5931\u8D25\uFF09\uFF1A${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+    }
+  }
+  throw new Error("\u767B\u5F55\u7B49\u5F85\u5DF2\u8D85\u65F6\uFF0C\u8BF7\u91CD\u65B0\u53D1\u8D77\u767B\u5F55");
+}
+/**
+ * 用 refresh_token 换新的 access_token。
+ *
+ * 出处：`src/kimi_cli/auth/oauth.py:503-520`。401/403 是**凭证终态**（由调用方
+ * 映射成 RefreshTokenExpired），其它状态码是可重试错误。
+ *
+ * @param {object} product 产品配置。
+ * @param {string} refreshToken 待兑换的刷新令牌。
+ * @param {{fetcher?: Function, deviceId?: string, signal?: AbortSignal}} options 传输与身份。
+ * @returns {Promise<{accessToken: string, refreshToken: string, expiresAt: number}>}
+ */
+async function refreshKimiToken(product, refreshToken, options = {}) {
+  const fetcher = options.fetcher ?? fetch;
+  const response = await fetcher(`${product.oauthHost}${KIMI_TOKEN_PATH}`, {
+    method: "POST",
+    headers: {
+      ...kimiIdentityHeaders(options.deviceId ?? ""),
+      Accept: "application/json",
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: new URLSearchParams({
+      client_id: product.clientId,
+      grant_type: "refresh_token",
+      refresh_token: refreshToken
+    }).toString(),
+    signal: options.signal ?? AbortSignal.timeout(KIMI_HTTP_TIMEOUT_MS)
+  });
+  const payload = await response.json().catch(() => ({}));
+  const record = kimiRecord(payload) ?? {};
+  if (response.status === 401 || response.status === 403) {
+    throw new RefreshTokenExpiredError7(
+      `Kimi \u7EED\u671F\u88AB\u62D2\u7EDD\uFF08HTTP ${response.status}\uFF09\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55`
+    );
+  }
+  if (!response.ok) {
+    const detail = kimiStringField(record.error_description) ?? JSON.stringify(payload).slice(0, 200);
+    throw new Error(`Kimi \u7EED\u671F\u5931\u8D25\uFF08HTTP ${response.status}\uFF09\uFF1A${detail}`);
+  }
+  const parsed = parseKimiTokenPayload(payload, refreshToken);
+  if (parsed.accessToken.length === 0) {
+    throw new RefreshTokenExpiredError7("\u7EED\u671F\u54CD\u5E94\u7F3A\u5C11\u8BBF\u95EE\u4EE4\u724C\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55");
+  }
+  return {
+    accessToken: parsed.accessToken,
+    // 上游未回新的 refresh_token 时沿用旧的（RFC 6749 §6）。
+    refreshToken: parsed.refreshToken ?? refreshToken,
+    expiresAt: parsed.expiresAt
+  };
+}
+
+// vendor/channel-pack/src/kimi-auth.ts
+var RefreshTokenExpiredError7 = class extends Error {
+  constructor(message2) {
+    super(message2);
+    this.name = "RefreshTokenExpiredError";
+  }
+};
+/**
+ * 解析一份 Kimi 凭据。
+ *
+ * 落库形状沿用 cline 的 JSON 习惯（`access_token` / `refresh_token` /
+ * `expires_at` 蛇形），这样凭据排障口径与既有渠道一致。
+ *
+ * @param {unknown} value JSON 字符串或对象。
+ * @returns {object|undefined} 规范化后的凭据，或 undefined。
+ */
+function parseKimiCredential(value) {
+  let parsed = value;
+  if (typeof value === "string") {
+    try {
+      parsed = JSON.parse(value);
+    } catch {
+      return void 0;
+    }
+  }
+  const record = kimiRecord(parsed);
+  if (record === void 0) return void 0;
+  const accessToken = kimiStringField(record.access_token) ?? kimiStringField(record.accessToken);
+  if (accessToken === void 0) return void 0;
+  const refreshToken = kimiStringField(record.refresh_token) ?? kimiStringField(record.refreshToken);
+  const rawExpiry = record.expires_at ?? record.expiresAt;
+  const expiresAt = typeof rawExpiry === "number" && Number.isFinite(rawExpiry) ? rawExpiry : typeof rawExpiry === "string" && rawExpiry.trim().length > 0 && Number.isFinite(Number(rawExpiry)) ? Number(rawExpiry) : void 0;
+  const identity = kimiIdentityFromTokens(accessToken, refreshToken);
+  const nickname = kimiStringField(record.nickname) ?? identity.email;
+  return {
+    access_token: accessToken,
+    ...refreshToken === void 0 ? {} : { refresh_token: refreshToken },
+    ...expiresAt === void 0 ? {} : { expires_at: expiresAt },
+    ...identity.accountId === void 0 ? {} : { account_id: identity.accountId },
+    ...nickname === void 0 ? {} : { nickname }
+  };
+}
+/**
+ * 凭据的绝对到期时刻（毫秒），读不到返回 undefined。
+ * @param {object|undefined} credential 凭据。
+ * @returns {number|undefined}
+ */
+function kimiCredentialExpiresAtMs(credential) {
+  const raw = credential?.expires_at;
+  return typeof raw === "number" && Number.isFinite(raw) && raw > 0 ? raw : void 0;
+}
+/**
+ * 凭据是否已过期（无到期时刻时视为未过期，交由上游 401 兜底）。
+ * @param {object|undefined} credential 凭据。
+ * @returns {boolean}
+ */
+function isKimiExpired(credential) {
+  const expiresAt = kimiCredentialExpiresAtMs(credential);
+  return expiresAt !== void 0 && expiresAt <= Date.now();
+}
+/**
+ * 凭据是否可续期。
+ * @param {object|undefined} credential 凭据。
+ * @returns {boolean}
+ */
+function isKimiRefreshable(credential) {
+  return typeof credential?.refresh_token === "string" && credential.refresh_token.length > 0;
+}
+/** 到期 / 可续期 / 身份三个访问器（供 `syncAccountExpiry` 使用）。 */
+var KIMI_EXPIRY_ACCESSORS = {
+  expiresAtOf: (credential) => kimiCredentialExpiresAtMs(credential),
+  refreshableOf: (credential) => isKimiRefreshable(credential),
+  identityOf: (credential) => credential?.account_id ?? ""
+};
+/**
+ * 生成稳定的设备 id。
+ *
+ * 官方要求 32 位小写十六进制（`klips/klip-14`「X-Msh-Device-Id 为稳定 UUID」），
+ * 且必须跨重启保持 —— 换 id 会被服务端当成新机器。
+ *
+ * @returns {string} 32 位十六进制。
+ */
+function mintKimiDeviceId() {
+  try {
+    return globalThis.crypto.randomUUID().replace(/-/g, "");
+  } catch {
+    return Buffer.from(Array.from({ length: 16 }, () => Math.floor(Math.random() * 256))).toString("hex");
+  }
+}
+
+// vendor/channel-pack/src/kimi-models.ts
+var KIMI_MODELS_TIMEOUT_MS = 2e4;
+/**
+ * 从 `/models` 的一行里抽事实。
+ *
+ * 字段名出自实测响应（见 KIMI_FALLBACK_MODELS 上方注释）：
+ * `id` / `display_name` / `context_length` / `limit.context` /
+ * `supports_image_in` / `think_efforts.valid_efforts` /
+ * `think_efforts.default_effort`。
+ *
+ * @param {unknown} row 一行原始数据。
+ * @returns {object|undefined}
+ */
+function parseKimiModelRow(row) {
+  const record = kimiRecord(row);
+  if (record === void 0) return void 0;
+  const id = kimiStringField(record.id)?.trim();
+  if (id === void 0 || id.length === 0) return void 0;
+  const name = kimiStringField(record.display_name)?.trim();
+  const limit = kimiRecord(record.limit);
+  const contextWindow = typeof record.context_length === "number" && record.context_length > 0 ? record.context_length : typeof limit?.context === "number" && limit.context > 0 ? limit.context : void 0;
+  const efforts = kimiRecord(record.think_efforts);
+  const validEfforts = Array.isArray(efforts?.valid_efforts) ? efforts.valid_efforts.filter((effort) => typeof effort === "string" && effort.length > 0) : void 0;
+  const defaultEffort = kimiStringField(efforts?.default_effort);
+  return {
+    id,
+    ...name === void 0 ? {} : { name },
+    ...contextWindow === void 0 ? {} : { contextWindow },
+    // 保守判定：只有明确报 true 才认为支持图片。
+    supportsImage: record.supports_image_in === true,
+    ...validEfforts === void 0 || validEfforts.length === 0 ? {} : { reasoningEfforts: validEfforts },
+    ...defaultEffort === void 0 ? {} : { defaultEffort }
+  };
+}
+/**
+ * 解析 `/models` 响应体。
+ * @param {unknown} payload 响应 JSON。
+ * @returns {object[]}
+ */
+function parseKimiModels(payload) {
+  const record = kimiRecord(payload);
+  const data = record?.data;
+  if (!Array.isArray(data)) return [];
+  const out = [];
+  const seen = /* @__PURE__ */ new Set();
+  for (const row of data) {
+    const parsed = parseKimiModelRow(row);
+    if (parsed === void 0 || seen.has(parsed.id)) continue;
+    seen.add(parsed.id);
+    out.push(parsed);
+  }
+  return out;
+}
+/**
+ * 把远端目录与兜底表合并（远端优先，兜底补窗口/图片能力）。
+ *
+ * 远端读不到时**整体退回兜底表** —— 目录是「能不能选模型」的前提，
+ * 不能因为一次目录抖动就让渠道不可用。
+ *
+ * @param {object[]} remote 远端条目。
+ * @returns {object[]}
+ */
+function mergeKimiModels(remote) {
+  if (remote.length === 0) {
+    return KIMI_FALLBACK_MODELS.map((model) => ({ ...model }));
+  }
+  const fallbackIndex = new Map(KIMI_FALLBACK_MODELS.map((model) => [model.id, model]));
+  return remote.map((entry) => {
+    const fallback = fallbackIndex.get(entry.id);
+    return {
+      id: entry.id,
+      name: entry.name ?? fallback?.name ?? entry.id,
+      contextWindow: entry.contextWindow ?? fallback?.contextWindow ?? KIMI_CONTEXT_WINDOW,
+      maxTokens: fallback?.maxTokens ?? KIMI_DEFAULT_MAX_TOKENS,
+      supportsImage: entry.supportsImage === true || fallback?.supportsImage === true,
+      ...entry.reasoningEfforts === void 0 ? {} : { reasoningEfforts: entry.reasoningEfforts },
+      ...entry.defaultEffort === void 0 ? {} : { defaultEffort: entry.defaultEffort }
+    };
+  });
+}
+/**
+ * 拉取 `/models` 目录。
+ *
+ * 端点见 `src/kimi_cli/auth/platforms.py:273`（`{base_url}/models`）。
+ * 任何失败都只是「这层没补充」，返回空表让调用方退回兜底，不抛错。
+ *
+ * @param {object} product 产品配置。
+ * @param {{fetcher?: Function, accessToken: string, deviceId?: string, signal?: AbortSignal}} options 传输与令牌。
+ * @returns {Promise<{models: object[], warning?: string}>}
+ */
+async function fetchKimiModels(product, options) {
+  const fetcher = options.fetcher ?? fetch;
+  try {
+    const response = await fetcher(`${product.apiBase}${product.modelsPath}`, {
+      method: "GET",
+      headers: {
+        ...kimiIdentityHeaders(options.deviceId ?? ""),
+        Authorization: `Bearer ${options.accessToken}`,
+        Accept: "application/json"
+      },
+      signal: options.signal ?? AbortSignal.timeout(KIMI_MODELS_TIMEOUT_MS)
+    });
+    if (!response.ok) {
+      return { models: [], warning: `models HTTP ${response.status}` };
+    }
+    return { models: parseKimiModels(await response.json()) };
+  } catch (error) {
+    return {
+      models: [],
+      warning: `models ${error instanceof Error ? error.message : String(error)}`
+    };
+  }
+}
+
+// vendor/channel-pack/src/kimi-adapter.ts
+import { LlmAdapter as LlmAdapter13, LlmError as LlmError21, ReasoningEffortId as ReasoningEffortId16 } from "@deepseek-ai/dsh-llm";
+/**
+ * Kimi Code 适配器（OpenAI 兼容 chat.completions + SSE）。
+ *
+ * 与 ClineAdapter 的差异及理由：
+ * · 鉴权只认 `Authorization: Bearer <access_token>`（无 token 前缀），
+ *   但**必须**同时带 `X-Msh-*` 设备身份头 —— 上游按这套头识别客户端家族；
+ * · 思考开关走 `thinking`（Moonshot 字段），不是 `reasoning_effort`；
+ * · 模型目录登录后从 `/models` 取，冷启动用兜底表。
+ */
+var KimiAdapter = class extends LlmAdapter13 {
+  constructor(options) {
+    super();
+    this.options = options;
+    this.product = options.product ?? KIMI;
+    this.fetchImpl = options.fetchImpl ?? fetch;
+  }
+  product;
+  fetchImpl;
+  /** 远端模型目录缓存（首次成功拉取后填充）。 */
+  remoteModels;
+  /** 进行中的目录加载（并发去重）。 */
+  loading;
+  /**
+   * 描述本适配器拥有的 provider 路由。
+   *
+   * 与 ClineAdapter 同款防御：provider 不是非空字符串时退回产品 id，
+   * 否则 DSH 侧 `provider.toUpperCase()` 会炸。
+   *
+   * @param {unknown} provider 上游传入的 provider id。
+   * @returns {{id: string, name: string}}
+   */
+  providerInfo(provider) {
+    const id = typeof provider === "string" && provider.length > 0 ? provider : this.product.id;
+    return { id, name: this.product.displayName };
+  }
+  /**
+   * 模型接受的输入模态。
+   *
+   * 判据是目录条目上的 `supportsImage`（远端 `supports_image_in` 或兜底表）。
+   * 没有结论时保守报 `text` —— 宁可少报能力，也不要报一个服务端不认的模态。
+   *
+   * @param {string} model 模型 id。
+   * @returns {string[]}
+   */
+  inputModalitiesFor(model) {
+    const entry = this.catalog().find((candidate) => candidate.id === model);
+    return entry?.supportsImage === true ? ["text", "image"] : ["text"];
+  }
+  /**
+   * 懒加载远端模型目录，并发去重。
+   *
+   * `resolveModel` 可能先于 `listModels` 被调用（直接进会话），故两处都调。
+   * @returns {Promise<void>}
+   */
+  async ensureRemoteModels() {
+    if (this.remoteModels !== void 0) return;
+    if (this.loading !== void 0) {
+      await this.loading;
+      return;
+    }
+    this.loading = (async () => {
+      try {
+        const credential = parseKimiCredential(await this.options.resolveCredential());
+        if (credential === void 0) return;
+        const loaded = await fetchKimiModels(this.product, {
+          fetcher: this.fetchImpl,
+          accessToken: credential.access_token,
+          ...this.options.deviceId === void 0 ? {} : { deviceId: this.options.deviceId() }
+        });
+        if (loaded.warning !== void 0) {
+          console.warn(`[kimi] \u6A21\u578B\u76EE\u5F55\u6765\u6E90\u5931\u8D25\uFF1A${loaded.warning}`);
+        }
+        if (loaded.models.length > 0) this.remoteModels = mergeKimiModels(loaded.models);
+      } catch (error) {
+        console.warn(`[kimi] \u6A21\u578B\u76EE\u5F55\u62C9\u53D6\u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        this.loading = void 0;
+      }
+    })();
+    await this.loading;
+  }
+  /** 兜底目录（远端不可用时的静态表）。 */
+  fallbackCatalog() {
+    return KIMI_FALLBACK_MODELS.map((model) => ({ ...model }));
+  }
+  /** 当前生效的目录（远端优先，未拉到时用兜底）。 */
+  catalog() {
+    return this.remoteModels ?? this.fallbackCatalog();
+  }
+  /**
+   * 完整模型目录（**不应用**用户黑名单）。
+   *
+   * 设置页要能渲染被关闭的模型（否则用户无法重新打开），故 RPC 层用这份。
+   * 同步方法（与 RPC 层契约一致）：首次调用会触发一次后台加载。
+   *
+   * @returns {{id: string, name: string}[]}
+   */
+  listAllModels() {
+    const source = this.catalog();
+    if (this.remoteModels === void 0) void this.ensureRemoteModels();
+    return source.map((model) => ({ id: model.id, name: model.name }));
+  }
+  /**
+   * 按用户黑名单过滤后的模型列表。
+   * @param {string} [_provider] provider id（忽略，本适配器只服务一个）。
+   * @returns {Promise<object[]>}
+   */
+  async listModels(_provider) {
+    if (!await providerCatalogVisible(this.options.accountPool, this.product.id)) return [];
+    await this.ensureRemoteModels();
+    const source = this.catalog();
+    const disabled = this.options.accountPool?.disabledModelsFor(this.product.id);
+    const listed = disabled === void 0 || disabled.size === 0 ? source : source.filter((model) => !disabled.has(model.id));
+    return listed.map((model) => ({
+      provider: this.product.id,
+      id: model.id,
+      name: model.name,
+      inputModalities: this.inputModalitiesFor(model.id)
+    }));
+  }
+  /**
+   * 解析一个模型 id 的完整信息。
+   * @param {string} provider provider id。
+   * @param {string} model 模型 id。
+   * @returns {Promise<object>}
+   */
+  async resolveModel(provider, model, _signal) {
+    await this.ensureRemoteModels();
+    const entry = this.catalog().find((candidate) => candidate.id === model);
+    const resolved = {
+      provider,
+      id: model,
+      name: entry?.name ?? model,
+      inputModalities: this.inputModalitiesFor(model),
+      context: { contextWindow: entry?.contextWindow ?? KIMI_CONTEXT_WINDOW },
+      defaultMaxTokens: entry?.maxTokens ?? KIMI_DEFAULT_MAX_TOKENS
+    };
+    resolved.reasoning = {
+      efforts: KIMI_REASONING_EFFORTS.map((effort) => ({
+        id: ReasoningEffortId16(effort.id),
+        name: effort.name
+      })),
+      defaultEffort: ReasoningEffortId16(KIMI_DEFAULT_REASONING_EFFORT)
+    };
+    return resolved;
+  }
+  /**
+   * 兼容 0.1.1-rc.2：新版 `LlmRuntime.prepareCall()` 会调用
+   * `registration.adapter.prepareCall(...)`，而本仓库链接的 dsh-llm 副本
+   * 基类尚未提供该方法。与 BuddyAdapter / QoderAdapter / ClineAdapter 同款 shim。
+   * @param {string} provider provider id。
+   * @param {string} model 模型 id。
+   * @param {AbortSignal} [signal] 取消信号。
+   * @returns {Promise<object>}
+   */
+  async prepareCall(provider, model, signal) {
+    return {
+      model: await this.resolveModel(provider, model, signal),
+      stream: (options) => this.stream(options)
+    };
+  }
+  /**
+   * 组装 `thinking` 字段。
+   *
+   * 出处：官方 `with_thinking()`（kim.py:214-222）写
+   * `thinking.type = enabled|disabled`；强度走 Moonshot 的 `thinking.effort`。
+   * `none` 等价于关闭。
+   *
+   * @param {unknown} effort harness 的 effort id。
+   * @returns {object|undefined}
+   */
+  thinkingPayload(effort) {
+    if (effort === void 0) return void 0;
+    const wire = KIMI_EFFORT_WIRE_MAP[String(effort)] ?? String(effort);
+    if (wire === "none") return { type: "disabled" };
+    return { type: "enabled", effort: wire };
+  }
+  /**
+   * 发起一次 chat 请求；网络失败映射为可重试的 TRANSPORT 错误。
+   * @param {object} credential 凭据。
+   * @param {string} body 请求体。
+   * @param {object} options harness 生成选项。
+   * @returns {Promise<Response>}
+   */
+  async send(credential, body, options) {
+    try {
+      return await this.fetchImpl(`${this.product.apiBase}${this.product.chatPath}`, {
+        method: "POST",
+        headers: {
+          ...kimiIdentityHeaders(this.options.deviceId === void 0 ? "" : this.options.deviceId()),
+          Authorization: `Bearer ${credential.access_token}`,
+          "Content-Type": "application/json",
+          Accept: "text/event-stream"
+        },
+        body,
+        signal: options.signal
+      });
+    } catch (error) {
+      if (options.signal?.aborted === true) throw error;
+      if (error instanceof TypeError) {
+        throw new LlmError21(
+          `kimi: transport error: ${error instanceof Error ? error.message : String(error)}`,
+          "TRANSPORT",
+          { cause: error }
+        );
+      }
+      throw error;
+    }
+  }
+  /**
+   * 流式生成。
+   *
+   * 换号语义对齐 cline：401/403 先试一次续期；仍失败就交给上层。
+   * 429/402 视为额度耗尽，走账号池换号（Kimi 是订阅额度制，
+   * 与 cline 的 credit 语义同形）。
+   *
+   * @param {object} options harness 生成选项。
+   * @returns {AsyncIterable<object>}
+   */
+  async *stream(options) {
+    const imageRefs = /* @__PURE__ */ new Map();
+    for (const message2 of options.messages) {
+      if (Array.isArray(message2.content)) collectImages3(message2.content, imageRefs);
+    }
+    let imageUrls;
+    if (imageRefs.size > 0) {
+      await this.ensureRemoteModels();
+      if (!this.inputModalitiesFor(options.model).includes("image")) {
+        throw new LlmError21(
+          `kimi: \u6A21\u578B "${options.model}" \u4E0D\u652F\u6301\u56FE\u7247\u8F93\u5165`,
+          "UNSUPPORTED_CONTENT"
+        );
+      }
+      if (this.options.readImage === void 0) {
+        throw new LlmError21("kimi: \u56FE\u7247\u8F93\u5165\u9700\u8981\u9644\u4EF6\u670D\u52A1", "UNSUPPORTED_CONTENT");
+      }
+      imageUrls = /* @__PURE__ */ new Map();
+      const readImage = this.options.readImage;
+      for (const [id, ref] of imageRefs) {
+        const projected = await projectRequestImage(ref, {
+          readImageRequest: this.options.readImageRequest,
+          pixelBudget: this.product.imagePixelBudget,
+          maxBytes: this.product.imageMaxBytes
+        });
+        const image = projected ?? await readImage(ref);
+        if (image === void 0) continue;
+        imageUrls.set(id, `data:${image.mediaType};base64,${Buffer.from(image.data).toString("base64")}`);
+      }
+    }
+    let credential = parseKimiCredential(await this.options.resolveCredential(options.model));
+    if (credential === void 0 || isKimiExpired(credential)) {
+      await this.options.refresh();
+      credential = parseKimiCredential(await this.options.resolveCredential(options.model));
+    }
+    if (credential === void 0 || credential.access_token.length === 0) {
+      throw new LlmError21("kimi: \u65E0\u53EF\u7528\u51ED\u636E\uFF0C\u8BF7\u5148\u767B\u5F55 Kimi Code", "MISSING_CREDENTIAL");
+    }
+    const messages = serializeMessages4(options.messages, imageUrls);
+    const bodyObj = {
+      model: options.model,
+      messages: options.system !== void 0 && options.system.length > 0 ? [{ role: "system", content: options.system }, ...messages] : messages,
+      stream: true
+    };
+    if (options.tools !== void 0 && options.tools.length > 0) {
+      bodyObj.tools = options.tools.map((tool) => ({
+        type: "function",
+        function: {
+          name: tool.name,
+          description: tool.description,
+          // 工具 schema 必须清洗后再下发（空串 enum 成员会让上游 400）。
+          parameters: sanitizeClineToolParameters(tool.parameters)
+        }
+      }));
+    }
+    if (options.maxTokens !== void 0) bodyObj.max_tokens = options.maxTokens;
+    if (options.stop !== void 0 && options.stop.length > 0) bodyObj.stop = options.stop;
+    // ⚠️ Kimi 锁定 temperature（订阅 coding 模型不接受自定义温度），
+    // 故**不下发** options.temperature —— 与 EricFL1998 实现一致。
+    const thinking = this.thinkingPayload(options.reasoningEffort);
+    if (thinking !== void 0) bodyObj.thinking = thinking;
+    const body = JSON.stringify(bodyObj);
+    let response = await this.send(credential, body, options);
+    if (!response.ok && (response.status === 401 || response.status === 403)) {
+      await this.options.refresh();
+      const refreshed = parseKimiCredential(await this.options.resolveCredential(options.model));
+      if (refreshed === void 0 || refreshed.access_token.length === 0) {
+        throw new LlmError21("kimi: \u51ED\u636E\u5DF2\u8FC7\u671F\u4E14\u7EED\u671F\u5931\u8D25", "AUTH", { status: response.status });
+      }
+      credential = refreshed;
+      response = await this.send(credential, body, options);
+    }
+    if (!response.ok) {
+      let errorText = await response.text().catch(() => "");
+      const shouldRotate = isKimiRotatableFailure(response.status, errorText);
+      if (this.options.accountPool !== void 0 && shouldRotate) {
+        const tried = /* @__PURE__ */ new Set();
+        for (let round = 0; round < KIMI_MAX_ROTATE; round++) {
+          const next = await this.options.accountPool.getAvailableAccount(this.product.id, options.model, tried);
+          if (next === null || next === void 0 || tried.has(next.entry.id)) break;
+          tried.add(next.entry.id);
+          const nextCredential = parseKimiCredential(next.credential);
+          if (nextCredential === void 0) continue;
+          credential = nextCredential;
+          response = await this.send(credential, body, options);
+          if (response.ok) break;
+          errorText = await response.text().catch(() => "");
+          if (!isKimiRotatableFailure(response.status, errorText)) break;
+        }
+      }
+      if (!response.ok) {
+        throw new LlmError21(`kimi: ${errorDetail4(errorText)}`, httpErrorCode4(response.status), { status: response.status });
+      }
+    }
+    yield* consumeOpenAiSse(response, { ...options.signal === void 0 ? {} : { signal: options.signal } }, {
+      label: "kimi",
+      firstTokenTimeoutMs: resolveKimiFirstTokenTimeoutMs(),
+      chunkTimeoutMs: resolveKimiChunkTimeoutMs(),
+      ...options.maxTokens === void 0 ? {} : { maxTokens: options.maxTokens }
+    });
+  }
+};
+/** 单轮最多换几个账号（含首个）。与 cline 同量级。 */
+var KIMI_MAX_ROTATE = 3;
+/**
+ * 判定一次失败是否值得换号。
+ *
+ * 与 cline 同口径：429/402 是额度耗尽，正文里的额度字样也算（上游偶尔用
+ * 400 + 文案表达额度问题）。
+ *
+ * @param {number} status HTTP 状态码。
+ * @param {string} body 响应正文。
+ * @returns {boolean}
+ */
+function isKimiRotatableFailure(status, body) {
+  if (status === 429 || status === 402) return true;
+  const lower = body.toLowerCase();
+  return KIMI_CREDIT_MARKERS.some((marker) => lower.includes(marker));
+}
+var KIMI_CREDIT_MARKERS = [
+  "insufficient",
+  "quota",
+  "rate limit",
+  "too many requests",
+  "balance",
+  "credit",
+  "exceeded",
+  "\u989D\u5EA6\u4E0D\u8DB3",
+  "\u4F59\u989D\u4E0D\u8DB3",
+  "\u9891\u7387\u9650\u5236"
+];
+function resolveKimiFirstTokenTimeoutMs() {
+  const raw = Number(process.env.DSH_KIMI_FIRST_TOKEN_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 12e4;
+}
+function resolveKimiChunkTimeoutMs() {
+  const raw = Number(process.env.DSH_KIMI_CHUNK_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 12e4;
+}
+function registerKimiLlm(ctx, options) {
+  const product = options.product ?? KIMI;
+  const adapter = new KimiAdapter(options);
+  registerAdapterIdempotent(ctx.llm, [product.id], adapter);
+  return adapter;
+}
+
+// vendor/channel-pack/src/kimi-auth-service.ts
+var KimiAuth = class extends Service7 {
+  constructor(ctx, options = {}) {
+    const product = options.product ?? KIMI;
+    super(ctx, options.serviceName ?? `${product.id}Auth`);
+    this.options = options;
+    this.product = product;
+    this.credentialRefName = this.product.defaultCredentialRef;
+    this.deviceId = options.deviceId ?? mintKimiDeviceId();
+  }
+  /** 本实例所属的产品配置。 */
+  product;
+  /** 本实例默认读写的凭据 ref 名称（`KIMI_ACCESS_TOKEN`）。 */
+  credentialRefName;
+  /** 稳定设备 id（`X-Msh-Device-Id`）。 */
+  deviceId;
+  scheduler = new RefreshScheduler(
+    () => this.refresh(),
+    (error) => {
+      if (error instanceof RefreshTokenExpiredError7) {
+        this.markRefreshTokenInvalid();
+        return;
+      }
+      this.lastRefreshError = error instanceof Error ? error.message : String(error);
+    }
+  );
+  /** refresh_token 已被后端判定失效；登录/刷新成功时重置。 */
+  refreshTokenInvalid = false;
+  lastRefreshError;
+  /** 登录会话是否仍活跃；logout()/stop() 置 false，防止在途刷新回写已登出凭据。 */
+  active = true;
+  /** 注入的 fetch（测试用）；默认为全局 fetch。 */
+  get fetchImpl() {
+    return this.options.fetcher ?? fetch;
+  }
+  /** 标记 refresh_token 已失效：停止重试，并向 status() 暴露 refreshable: false。 */
+  markRefreshTokenInvalid() {
+    this.refreshTokenInvalid = true;
+    this.lastRefreshError = "refresh_token \u5DF2\u5931\u6548\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55";
+  }
+  /**
+   * 运行完整登录流程并持久化凭据。
+   *
+   * `accountId` + `pool` 同时提供时，登录成功后自动把账号登记进账号池
+   * （Channel Pack 的「+ 新建账号」路径）。
+   *
+   * @param {object} [flowOptions] `refName` / `accountId` / `pool` / `openBrowser`。
+   * @returns {Promise<object>} 登录结果（`access` 是 JSON 字符串）。
+   */
+  async login(flowOptions = {}) {
+    this.active = true;
+    const flow = await this.runLoginFlow(flowOptions);
+    return this.persistLogin(flow, flowOptions);
+  }
+  /**
+   * **两步式登录**：立即返回 verification URL，由调用方先打开窗口。
+   *
+   * 与 CodeArts / Qoder / Cline 同因（真实缺陷）：阻塞式 `login()` 会让
+   * `window.open` 落在 transient activation（约 5 秒）之外而被拦截，
+   * 前端兜底随后把整个设置页跳转到登录页。
+   *
+   * @param {object} [flowOptions] 登录选项。
+   * @returns {Promise<object>} `{loginUrl, userCode?, result, close}`。
+   */
+  async startLogin(flowOptions = {}) {
+    this.active = true;
+    const controller = new AbortController();
+    const authorization = await requestKimiDeviceAuthorization(this.product, {
+      ...this.options.fetcher === void 0 ? {} : { fetcher: this.options.fetcher },
+      deviceId: this.deviceId
+    });
+    const loginUrl = authorization.verificationUriComplete ?? authorization.verificationUri;
+    // `settled` 保证 close() 之后不再中止一个已完成的轮询。
+    const state = { settled: false };
+    const result = pollKimiDeviceToken(authorization, {
+      product: this.product,
+      ...this.options.fetcher === void 0 ? {} : { fetcher: this.options.fetcher },
+      deviceId: this.deviceId,
+      signal: controller.signal,
+      ...flowOptions.timeoutMs === void 0 ? {} : { timeoutMs: flowOptions.timeoutMs },
+      ...flowOptions.pollIntervalMs === void 0 ? {} : { pollIntervalMs: flowOptions.pollIntervalMs }
+    }).then((tokens) => {
+      state.settled = true;
+      return {
+        access: JSON.stringify({
+          access_token: tokens.accessToken,
+          ...tokens.refreshToken === void 0 ? {} : { refresh_token: tokens.refreshToken },
+          expires_at: tokens.expiresAt
+        })
+      };
+    });
+    result.catch(() => {
+    });
+    return {
+      loginUrl,
+      userCode: authorization.userCode,
+      result,
+      close: async () => {
+        if (state.settled) return;
+        controller.abort();
+      }
+    };
+  }
+  /**
+   * 跑一次登录并等结果（阻塞版，`login()` 用）。
+   * @param {object} flowOptions 登录选项。
+   * @returns {Promise<object>}
+   */
+  async runLoginFlow(flowOptions) {
+    const started = await this.startLogin(flowOptions);
+    try {
+      const open = flowOptions.openBrowser;
+      if (typeof open === "function") {
+        await open(started.loginUrl);
+      }
+      return await started.result;
+    } finally {
+      await started.close();
+    }
+  }
+  /**
+   * 持久化一次登录结果：写凭据、重置失效状态、武装续期、按需登记账号池。
+   *
+   * 抽成独立方法供 {@link login} 与 {@link startLogin} 调用 ——
+   * 两条路径的差别只在「何时返回 loginUrl」，落库逻辑必须完全一致。
+   *
+   * @param {object} flow 登录结果。
+   * @param {object} flowOptions 登录选项。
+   * @returns {Promise<object>}
+   */
+  async persistLogin(flow, flowOptions = {}) {
+    const ref = flowOptions.refName ? credentialRef7(flowOptions.refName) : credentialRef7(this.credentialRefName);
+    await this.ctx.credentials.set(ref, flow.access);
+    this.refreshTokenInvalid = false;
+    this.lastRefreshError = void 0;
+    const credential = parseKimiCredential(flow.access);
+    const expiresAt = kimiCredentialExpiresAtMs(credential);
+    if (expiresAt !== void 0) this.scheduler.arm(expiresAt);
+    if (flowOptions.accountId !== void 0 && flowOptions.pool !== void 0) {
+      await flowOptions.pool.addAccount({
+        id: flowOptions.accountId,
+        provider: this.product.id,
+        nickname: credential?.nickname ?? flowOptions.accountId,
+        enabled: true,
+        credentialRef: flowOptions.refName ?? this.credentialRefName,
+        refreshable: isKimiRefreshable(credential),
+        ...expiresAt === void 0 ? {} : { expiresAt },
+        createdAt: Date.now()
+      });
+    }
+    return flow;
+  }
+  /**
+   * 对一份凭据执行一次续期并返回新凭据（不触碰存储）。
+   *
+   * 抽出来供 `refresh()` / `refreshAccountCredential()` 共用，避免两处各写一遍
+   * 「发请求 → 判终态 → 合并字段」而逐渐分叉。
+   *
+   * @param {object} credential 旧凭据。
+   * @returns {Promise<string>} 新凭据（蛇形落库形状的 JSON）。
+   */
+  async refreshCredential(credential) {
+    if (!isKimiRefreshable(credential)) {
+      throw new RefreshTokenExpiredError7("\u65E0 refresh_token\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55");
+    }
+    const refreshed = await refreshKimiToken(this.product, credential.refresh_token, {
+      ...this.options.fetcher === void 0 ? {} : { fetcher: this.options.fetcher },
+      deviceId: this.deviceId
+    });
+    return JSON.stringify({
+      access_token: refreshed.accessToken,
+      refresh_token: refreshed.refreshToken,
+      expires_at: refreshed.expiresAt,
+      ...credential.account_id === void 0 ? {} : { account_id: credential.account_id },
+      ...credential.nickname === void 0 ? {} : { nickname: credential.nickname }
+    });
+  }
+  /** 续期默认单凭据 ref。 */
+  async refresh() {
+    const ref = credentialRef7(this.credentialRefName);
+    const resolved = await this.ctx.credentials.resolve(ref);
+    if (!resolved) throw new Error("\u672A\u914D\u7F6E\u51ED\u636E\uFF0C\u8BF7\u5148\u767B\u5F55");
+    const credential = parseKimiCredential(resolved.value);
+    if (credential === void 0) throw new Error("\u51ED\u636E\u89E3\u6790\u5931\u8D25");
+    try {
+      const refreshed = await this.refreshCredential(credential);
+      if (!this.active) return;
+      await this.ctx.credentials.set(ref, refreshed);
+      this.refreshTokenInvalid = false;
+      this.lastRefreshError = void 0;
+      const expiresAt = kimiCredentialExpiresAtMs(parseKimiCredential(refreshed));
+      if (expiresAt !== void 0) this.scheduler.arm(expiresAt);
+    } catch (error) {
+      if (error instanceof RefreshTokenExpiredError7) this.markRefreshTokenInvalid();
+      throw error;
+    }
+  }
+  /**
+   * 按凭据 ref 续期**指定账号**的凭据，并回写账号池的 `expiresAt`。
+   *
+   * 回写是必须的：UI 账号卡片读的是池里的值，只 `credentials.set` 会让
+   * 「续期成功但界面仍显示已过期」（cline 那边的真实缺陷形态）。
+   *
+   * 与 {@link refresh} 的区别：那个读写本实例的默认单凭据 ref
+   * （`KIMI_ACCESS_TOKEN`），而账号卡片对应的是 `KIMI_ACCOUNT_XXX`。
+   *
+   * @param {string} refName 凭据 ref 名。
+   * @param {object} [pool] 账号池。
+   * @param {string} [accountId] 账号 id。
+   * @returns {Promise<void>}
+   */
+  async refreshAccountCredential(refName, pool, accountId) {
+    const ref = credentialRef7(refName);
+    const resolved = await this.ctx.credentials.resolve(ref);
+    if (!resolved) throw new Error("\u51ED\u636E\u672A\u914D\u7F6E");
+    const credential = parseKimiCredential(resolved.value);
+    if (credential === void 0) throw new Error("\u51ED\u636E\u89E3\u6790\u5931\u8D25");
+    if (!isKimiRefreshable(credential)) {
+      throw new RefreshTokenExpiredError7("\u65E0 refresh_token\uFF0C\u8BF7\u91CD\u65B0\u767B\u5F55");
+    }
+    const refreshed = await this.refreshCredential(credential);
+    await this.ctx.credentials.set(ref, refreshed);
+    await syncAccountExpiry({
+      pool,
+      provider: this.product.id,
+      credential: parseKimiCredential(refreshed),
+      accessors: KIMI_EXPIRY_ACCESSORS,
+      accountId,
+      tag: "[kimi]",
+      warn: (message2) => this.ctx.logger?.warn?.(message2)
+    });
+  }
+};
 // vendor/channel-pack/src/index.ts
 import { execFile as execFile2 } from "node:child_process";
 function lazyOpencodeUserAgent() {
@@ -69111,7 +70422,12 @@ function apply(ctx, config = {}) {
     // ⚠️ Gemini **可续期**（Google OAuth 的 refresh_token，且会轮换）。
     // ⚠️ 漏了这一行定时器不武装：凭据到期后**不会自动续期**，
     // 用户会看到「每隔一小时就要重新登录」，且日志里一个字都没有。
-    ["gemini", (p) => gemini.refreshAll(p)]
+    ["gemini", (p) => gemini.refreshAll(p)],
+    // Kimi **可续期**（refresh_token 授权，401/403 视为凭证终态）。
+    // 与 buddy 同款 createPoolRefresh：账号池里有可用账号就刷池内 ref
+    // （回写 expiresAt，否则界面会显示「续期成功但仍已过期」——
+    // cline 那边的真实缺陷形态），否则刷默认单凭据。
+    ["kimi", createPoolRefresh(pool, "kimi", kimi)]
   ];
   async function refreshAllCredentials() {
     for (const [tag2, refreshAll] of refreshTargets) {
@@ -69160,7 +70476,38 @@ function apply(ctx, config = {}) {
     loomy.stop();
     zcode.stop();
     zcodeAdapter.stop();
+    kimi.stop();
   }, "codearts-auth.scheduler (legacy)");
+  // ── Kimi Code 渠道（OAuth 2.0 Device Authorization Grant / RFC 8628）──
+  //
+  // 登录 / 续期 / 账号池的实现在上方 kimi-* 段（源码出处见那段的头注释：
+  // 官方 MoonshotAI/kimi-cli + 交叉验证 EricFL1998/dsh-subscription-oauth，MIT）。
+  // 这里只做三件事：实例化认证服务、注册 adapter、接进账号池与续期调度。
+  const kimi = new KimiAuth(ctx, { product: KIMI });
+  const kimiAdapter = registerKimiLlm(ctx, {
+    credentialRef: credentialRef16(KIMI.defaultCredentialRef),
+    resolveCredential: async (modelId) => {
+      const available2 = await pool.getAvailableAccount(KIMI.id, modelId ?? "");
+      if (available2) {
+        reportLedgerAccount(KIMI.id, available2.entry.id);
+        return available2.credential;
+      }
+      const resolved = await ctx.credentials.resolve(credentialRef16(KIMI.defaultCredentialRef));
+      if (!resolved) return void 0;
+      try {
+        return JSON.parse(resolved.value);
+      } catch {
+        return void 0;
+      }
+    },
+    // 与 buddy 同款：账号池里有可用账号就刷池内 ref（回写 expiresAt），
+    // 否则刷默认单凭据。漏了这条会出现「续期成功但界面仍显示已过期」。
+    refresh: createPoolRefresh(pool, "kimi", kimi),
+    readImage: makeReadImage(ctx),
+    readImageRequest: makeReadImageRequest(ctx),
+    accountPool: pool,
+    product: KIMI
+  });
   let opencodeAdapter;
   if (config.disableOpencode !== true) {
     const opencodeUA = lazyOpencodeUserAgent();
@@ -69266,6 +70613,7 @@ function apply(ctx, config = {}) {
     minimax: pruned(MINIMAX.id, minimaxAdapter),
     gemini: pruned(GEMINI.id, geminiAdapter),
     zcode: pruned(ZCODE.id, zcodeAdapter),
+    kimi: pruned(KIMI.id, kimiAdapter),
     ...opencodeAdapter === void 0 ? {} : { opencode: pruned(OPENCODE.id, opencodeAdapter) }
   };
   ctx.effect(() => () => {

@@ -66,6 +66,7 @@ window.__ModuleLoader__.load({
       minimax: { label: 'MiniMax', hint: '浏览器授权登录' },
       zcode: { label: 'ZCode / Z.ai', hint: '需要过验证码' },
       gemini: { label: 'Gemini', hint: '浏览器授权登录' },
+      kimi: { label: 'Kimi Code', hint: 'OAuth 设备码（浏览器输入 user code）' },
       opencode: { label: 'OpenCode', hint: '免费档（常被限流）' },
     }
 
