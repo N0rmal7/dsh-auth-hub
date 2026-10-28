@@ -13,3 +13,4 @@ coverage/
 # 本地排障工作目录：含真实凭据的探针脚本与上游原始响应，绝不入库
 .probe/
 *.bak-*
+build_platforms.js/
