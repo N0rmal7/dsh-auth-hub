@@ -70399,6 +70399,39 @@ function apply(ctx, config = {}) {
     ctx.logger.warn(`[channel-pack] \u4FEE\u6B63 Gemini \u8D26\u53F7\u663E\u793A\u540D\u5931\u8D25\uFF1A${String(error)}`);
   });
   const REFRESH_INTERVAL_MS = 30 * 60 * 1e3;
+  // ── Kimi Code 渠道（OAuth 2.0 Device Authorization Grant / RFC 8628）──
+  //
+  // 登录 / 续期 / 账号池的实现在上方 kimi-* 段（源码出处见那段的头注释：
+  // 官方 MoonshotAI/kimi-cli + 交叉验证 EricFL1998/dsh-subscription-oauth，MIT）。
+  // ⚠️ 实例化必须在 refreshTargets **之前**：refreshTargets 数组字面量会立即
+  // 执行 createPoolRefresh(...)，若 kimi 尚未声明就是 TDZ ReferenceError，
+  // apply() 整体失败、channel-pack 一个渠道都挂不上（2026-10-28 线上事故，
+  // 症状是「全部渠道出错」—— 已把它从 effect 区上移到这里修复）。
+  const kimi = new KimiAuth(ctx, { product: KIMI });
+  const kimiAdapter = registerKimiLlm(ctx, {
+    credentialRef: credentialRef16(KIMI.defaultCredentialRef),
+    resolveCredential: async (modelId) => {
+      const available2 = await pool.getAvailableAccount(KIMI.id, modelId ?? "");
+      if (available2) {
+        reportLedgerAccount(KIMI.id, available2.entry.id);
+        return available2.credential;
+      }
+      const resolved = await ctx.credentials.resolve(credentialRef16(KIMI.defaultCredentialRef));
+      if (!resolved) return void 0;
+      try {
+        return JSON.parse(resolved.value);
+      } catch {
+        return void 0;
+      }
+    },
+    // 与 buddy 同款：账号池里有可用账号就刷池内 ref（回写 expiresAt），
+    // 否则刷默认单凭据。漏了这条会出现「续期成功但界面仍显示已过期」。
+    refresh: createPoolRefresh(pool, "kimi", kimi),
+    readImage: makeReadImage(ctx),
+    readImageRequest: makeReadImageRequest(ctx),
+    accountPool: pool,
+    product: KIMI
+  });
   const refreshTargets = [
     ["codearts", (p) => service.refreshAll(p)],
     ["buddy", (p) => buddy.refreshAll(p)],
@@ -70478,36 +70511,6 @@ function apply(ctx, config = {}) {
     zcodeAdapter.stop();
     kimi.stop();
   }, "codearts-auth.scheduler (legacy)");
-  // ── Kimi Code 渠道（OAuth 2.0 Device Authorization Grant / RFC 8628）──
-  //
-  // 登录 / 续期 / 账号池的实现在上方 kimi-* 段（源码出处见那段的头注释：
-  // 官方 MoonshotAI/kimi-cli + 交叉验证 EricFL1998/dsh-subscription-oauth，MIT）。
-  // 这里只做三件事：实例化认证服务、注册 adapter、接进账号池与续期调度。
-  const kimi = new KimiAuth(ctx, { product: KIMI });
-  const kimiAdapter = registerKimiLlm(ctx, {
-    credentialRef: credentialRef16(KIMI.defaultCredentialRef),
-    resolveCredential: async (modelId) => {
-      const available2 = await pool.getAvailableAccount(KIMI.id, modelId ?? "");
-      if (available2) {
-        reportLedgerAccount(KIMI.id, available2.entry.id);
-        return available2.credential;
-      }
-      const resolved = await ctx.credentials.resolve(credentialRef16(KIMI.defaultCredentialRef));
-      if (!resolved) return void 0;
-      try {
-        return JSON.parse(resolved.value);
-      } catch {
-        return void 0;
-      }
-    },
-    // 与 buddy 同款：账号池里有可用账号就刷池内 ref（回写 expiresAt），
-    // 否则刷默认单凭据。漏了这条会出现「续期成功但界面仍显示已过期」。
-    refresh: createPoolRefresh(pool, "kimi", kimi),
-    readImage: makeReadImage(ctx),
-    readImageRequest: makeReadImageRequest(ctx),
-    accountPool: pool,
-    product: KIMI
-  });
   let opencodeAdapter;
   if (config.disableOpencode !== true) {
     const opencodeUA = lazyOpencodeUserAgent();

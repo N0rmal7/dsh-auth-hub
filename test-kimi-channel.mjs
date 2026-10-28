@@ -127,6 +127,23 @@ check('stop() 清理链包含 kimi', () => {
   assert.match(block, /kimi\.stop\(\)/)
 })
 
+check('★ 声明顺序：kimi 必须先于所有使用点（TDZ 事故回归防护）', () => {
+  // 2026-10-28 线上事故：kimi 声明在 refreshTargets 之后，数组字面量立即执行
+  // createPoolRefresh(..., kimi) → TDZ ReferenceError → apply() 整体失败 →
+  // 全部渠道挂不上（用户看到「全部渠道出错」）。锁定顺序：
+  // 声明 < adapter.refresh 字段 < refreshTargets < stop，且声明只有一处。
+  const decl = packSrc.indexOf('const kimi = new KimiAuth(')
+  assert.ok(decl > 0, '未找到 kimi 声明')
+  const adapterRefresh = packSrc.indexOf('refresh: createPoolRefresh(pool, "kimi", kimi)', decl)
+  assert.ok(adapterRefresh > decl, 'adapter 的 refresh 字段出现在声明之前')
+  const targets = packSrc.indexOf('["kimi", createPoolRefresh(pool, "kimi", kimi)]', decl)
+  assert.ok(targets > decl, 'refreshTargets 出现在声明之前（TDZ）')
+  const stop = packSrc.indexOf('kimi.stop()', decl)
+  assert.ok(stop > decl, 'stop 链出现在声明之前')
+  const occurrences = packSrc.split('const kimi = new KimiAuth(').length - 1
+  assert.equal(occurrences, 1, `kimi 声明出现 ${occurrences} 次，应为 1 次`)
+})
+
 console.log('\n=== 5. client 外观 ===')
 
 check('PLATFORM_APPEARANCE 有 kimi 条目', () => {
