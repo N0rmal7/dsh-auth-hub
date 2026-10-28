@@ -61342,7 +61342,22 @@ function registerChannelPackEndpoints(ctx, pool, codearts, buddy, workbuddy, lob
             });
           });
           // userCode 一起下发：device flow 需要用户在浏览器里输入这串码。
-          return { ok: true, value: { accountId: id, loginUrl: started.loginUrl, userCode: started.userCode } };
+          // loginUrlComplete（带 user_code 的直达链接）优先给前端打开，
+          // 用户可以不用手输 code —— 官方 CLI 同款行为（kimi-cli oauth.py）。
+          const kimiComplete = typeof started.loginUrlComplete === 'string' && started.loginUrlComplete !== ''
+            ? started.loginUrlComplete
+            : (started.userCode !== void 0 && started.loginUrl !== void 0
+              ? `${started.loginUrl}?user_code=${encodeURIComponent(started.userCode)}`
+              : void 0);
+          return {
+            ok: true,
+            value: {
+              accountId: id,
+              loginUrl: started.loginUrl,
+              ...kimiComplete === void 0 ? {} : { loginUrlComplete: kimiComplete },
+              userCode: started.userCode
+            }
+          };
         } else if (provider === LOOMY.id) {
           await pool.addAccount({
             id,
@@ -69416,6 +69431,9 @@ var KimiAuth = class extends Service7 {
     });
     return {
       loginUrl,
+      // 直达链接（带 user_code）已经在 loginUrl 里（优先取了 verificationUriComplete），
+      // 单独再暴露一份裸 verificationUri 供「重新打开」按钮使用。
+      loginUrlComplete: authorization.verificationUriComplete ?? void 0,
       userCode: authorization.userCode,
       result,
       close: async () => {

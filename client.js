@@ -625,8 +625,20 @@ window.__ModuleLoader__.load({
           const accountId = value?.accountId
           const url = value?.loginUrl
           if (typeof accountId !== 'string' || accountId === '') throw new Error('渠道未返回账号占位 id')
-          if (typeof url === 'string' && url !== '') openExternal(url)
-          setLogin({ accountId, url: typeof url === 'string' ? url : '', startedAt: Date.now() })
+          // device flow（Kimi 等）：上游给 verification_uri_complete（带 user_code 的
+          // 直达链接）时优先打开它——用户无需手输 code。裸 userCode 也展示出来，
+          // 万一直达链接没生效，用户还能在 verification_uri 页面手动输入。
+          const urlComplete = typeof value?.loginUrlComplete === 'string' && value.loginUrlComplete !== ''
+            ? value.loginUrlComplete : ''
+          const openUrl = urlComplete !== '' ? urlComplete : (typeof url === 'string' ? url : '')
+          if (openUrl !== '') openExternal(openUrl)
+          setLogin({
+            accountId,
+            url: typeof url === 'string' ? url : '',
+            urlComplete,
+            userCode: typeof value?.userCode === 'string' ? value.userCode : '',
+            startedAt: Date.now(),
+          })
           setOpen(true)
           onRefresh(true)
         } catch (error) { onError(platform, error) } finally { setBusy('') }
@@ -699,11 +711,28 @@ window.__ModuleLoader__.load({
               h('span', { style: statusStyle }, '等待浏览器完成登录…'),
               h('span', { style: accountMetaStyle }, `剩余 ${remainingText(login.startedAt)}`),
             ]),
+            // device flow（Kimi 等）：把 user code 大字展示出来 ——
+            // 上游给的是 verification_uri（不带 code），用户必须在页面里输入它。
+            login.userCode !== '' ? h('div', { style: { ...rowStyle, alignItems: 'center', gap: 8 } }, [
+              h('span', { style: accountMetaStyle }, '在打开的页面输入：'),
+              h('span', {
+                style: {
+                  fontFamily: 'monospace', fontSize: 15, fontWeight: 600,
+                  letterSpacing: 1.5, padding: '2px 10px',
+                  border: '1px solid var(--dsw-alias-border-strong, #888)', borderRadius: 6,
+                  userSelect: 'text',
+                },
+              }, login.userCode),
+              h('button', {
+                type: 'button', style: linkStyle,
+                onClick: () => { try { void navigator.clipboard.writeText(login.userCode) } catch { /* 剪贴板不可用就手输 */ } },
+              }, '复制'),
+            ]) : null,
             h('div', { style: progressTrackStyle }, h('div', {
               style: { ...progressBarStyle, width: `${Math.min(100, ((Date.now() - login.startedAt) / LOGIN_TIMEOUT_MS) * 100)}%` },
             })),
             h('div', { style: accountActionsStyle }, [
-              login.url !== '' ? h('button', { key: 'reopen', type: 'button', style: linkStyle, onClick: () => openExternal(login.url) }, '重新打开登录页') : null,
+              login.url !== '' ? h('button', { key: 'reopen', type: 'button', style: linkStyle, onClick: () => openExternal(login.urlComplete !== '' ? login.urlComplete : login.url) }, login.urlComplete !== '' ? '重新打开授权页' : '重新打开登录页') : null,
               h(ActionButton, { key: 'cancel', small: true, onClick: () => setLogin(null) }, '取消'),
             ]),
           ]) : null,

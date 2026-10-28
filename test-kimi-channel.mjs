@@ -127,6 +127,26 @@ check('stop() 清理链包含 kimi', () => {
   assert.match(block, /kimi\.stop\(\)/)
 })
 
+check('device flow 的 userCode / 直达链接会下发到前端', () => {
+  // host：account.create kimi 分支必须同时给 loginUrl + userCode + loginUrlComplete
+  const s = packSrc.indexOf('provider === KIMI.id')
+  const block = packSrc.slice(s, s + 2400)
+  assert.match(block, /userCode: started\.userCode/)
+  assert.match(block, /loginUrlComplete/)
+  assert.match(block, /loginUrl: started\.loginUrl/)
+})
+
+check('client 会展示 userCode（device flow 需要用户手输/直达链接）', () => {
+  // login state 要带 userCode 与 urlComplete
+  assert.match(clientSrc, /userCode: typeof value\?\.userCode === 'string'/)
+  assert.match(clientSrc, /loginUrlComplete/)
+  // 登录等待区要渲染 userCode（monospace 大字 + 复制按钮）
+  assert.match(clientSrc, /在打开的页面输入：/)
+  assert.match(clientSrc, /login\.userCode\)/)
+  // 优先打开直达链接
+  assert.match(clientSrc, /openUrl = urlComplete !== '' \? urlComplete :/)
+})
+
 check('★ 声明顺序：kimi 必须先于所有使用点（TDZ 事故回归防护）', () => {
   // 2026-10-28 线上事故：kimi 声明在 refreshTargets 之后，数组字面量立即执行
   // createPoolRefresh(..., kimi) → TDZ ReferenceError → apply() 整体失败 →
