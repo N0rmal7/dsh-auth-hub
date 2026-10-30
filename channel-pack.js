@@ -1,10 +1,10 @@
 /**
- * 账号渠道加载器：把内置的 channel-pack（13 个渠道的登录 / 账号池 / 积分）挂进本插件。
+ * 账号渠道加载器：把内置的 channel-pack（渠道的登录 / 账号池 / 积分）挂进本插件。
  *
  * 迁移说明（2026-10-21）：这份 `vendor/channel-pack/pack.js` 原属 `dsh-our-free-model`，
  * 现由本插件自己持有并加载，所以**不需要再安装 `dsh-our-free-model`**。
  * 由 `pack.apply(ctx, config)` 自己完成：
- *   - 用 `ctx.llm` 注册 13 个账号渠道适配器（codearts / buddy / workbuddy / lobsterai /
+ *   - 用 `ctx.llm` 注册账号渠道适配器（codearts / buddy / workbuddy / lobsterai /
  *     qoder / qodercn / trae / cline / loomy / raccoon / minimax / zcode / gemini）
  *   - 账号池落 `$DSH_HOME/channel-pack/state.json`，凭据落 `$DSH_HOME/.credentials.yaml`
  *   - 在本插件的 web 服务上自挂 `/api/channel-pack`（connection RPC）与验证码载体页
@@ -46,7 +46,7 @@ export async function mountChannelPack(ctx, options = {}) {
       disableOpencode: true,
       ...(options.outlet === undefined ? {} : { outlet: options.outlet }),
     })
-    info('auth-hub: 内置 channel-pack 已挂载（13 个账号渠道）')
+    info('auth-hub: 内置 channel-pack 已挂载（账号渠道清单由 platform.list 动态下发）')
     return { ok: true, pack }
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error)

@@ -2,11 +2,11 @@
  * DSH 账号中心 —— Host 半身。
  *
  * 现在**自己就是账号渠道的宿主**：内置 `vendor/channel-pack/pack.js`（原属
- * `dsh-our-free-model`，13 个渠道的登录 / 账号池 / 积分领取），所以不再需要装
+ * `dsh-our-free-model`，内置渠道的登录 / 账号池 / 积分领取），所以不再需要装
  * 那个插件。WorkBuddy 的双区登录也走内置 pack。
  *
  * v0.4.0 起还多了一层**自己加的签到渠道**（`checkin-channels.js` +
- * `checkin-runner.js`）：内置那 13 个渠道必须逆向登录协议才能加，而「每日签到」
+ * `checkin-runner.js`）：内置渠道必须逆向登录协议才能加，而「每日签到」
  * 这件事只是一发 HTTP + JSON 判成败，所以它被做成了声明式配置——粘一条 cURL
  * 就能接一个新站点，每天自动签、奖励进同一个积分台账。
  *
@@ -502,12 +502,17 @@ function keyMatches(presented) {
  * 找不到时返回 undefined，界面据此显示「未登录」。
  */
 async function resolveGrowthCredential(provider) {
-  const state = readJsonFile(path.join(stateDir(), 'state.json'), { accounts: [] })
-  const accounts = Array.isArray(state?.accounts) ? state.accounts : []
-  const match = accounts.find(account => account?.provider === provider && account?.enabled !== false)
-  if (match === undefined) return undefined
-  const ref = typeof match.credentialRef === 'string' ? match.credentialRef : ''
-  if (ref === '') return undefined
+  // 向后兼容：单账号形态（只返回凭据本体）。多账号请用 resolveGrowthAccounts()。
+  const first = resolveGrowthAccounts(provider)[0]
+  return first?.credential
+}
+
+/**
+ * 定位某个 credentialRef 在 `.credentials.yaml` 里的凭据块，解析成
+ * `{ accessToken, domain }`。解析不出来返回 undefined。
+ */
+function parseGrowthCredentialRef(ref) {
+  if (typeof ref !== 'string' || ref === '') return undefined
   const raw = readCredentialsFile()
   const block = new RegExp(`${ref}\\s*:\\s*'([\\s\\S]*?)'(?=\\s*\\n|$)`).exec(raw) ?? new RegExp(`${ref}\\s*:\\s*"([\\s\\S]*?)"(?=\\s*\\n|$)`).exec(raw)
   if (block === null) return undefined
@@ -519,6 +524,143 @@ async function resolveGrowthCredential(provider) {
   const accessToken = pick('access_token') ?? pick('accessToken')
   if (typeof accessToken !== 'string' || accessToken === '') return undefined
   return { accessToken, domain: pick('domain') ?? pick('api_domain') ?? '' }
+}
+
+/**
+ * **该 provider 下所有启用账号**的成长凭据（按 `state.json` 顺序）。
+ *
+ * 为什么必须遍历而不是 `.find()`：一个渠道下常有多个账号（实测本机 `buddy` 与
+ * `workbuddy` 各 2 个启用账号），原先的 `.find()` 只清扫了**第一个**，其余账号
+ * 的每日任务/旅行奖励永远不会被领——而这些都是「送钱」操作，漏一个就是净损失。
+ *
+ * @returns {Array<{ accountId: string, nickname: string, ref: string, credential: { accessToken: string, domain: string } }>}
+ *   只包含**凭据可解析**的账号；解析失败的账号会被跳过（记进 skipped 由调用方决定是否提示）。
+ */
+export function resolveGrowthAccounts(provider, options = {}) {
+  const state = readJsonFile(path.join(stateDir(), 'state.json'), { accounts: [] })
+  const accounts = Array.isArray(state?.accounts) ? state.accounts : []
+  const wanted = options.ids === undefined ? undefined : new Set(options.ids)
+  const out = []
+  for (const account of accounts) {
+    if (account === null || typeof account !== 'object') continue
+    if (account.provider !== provider) continue
+    if (account.enabled === false) continue
+    if (typeof account.id !== 'string' || account.id === '') continue
+    if (wanted !== undefined && !wanted.has(account.id)) continue
+    const ref = typeof account.credentialRef === 'string' ? account.credentialRef : ''
+    const credential = parseGrowthCredentialRef(ref)
+    if (credential === undefined) continue
+    out.push({
+      accountId: account.id,
+      nickname: typeof account.nickname === 'string' ? account.nickname : '',
+      ref,
+      credential,
+    })
+  }
+  return out
+}
+
+/**
+ * 逐个清扫某 provider 下**全部启用账号**，每个账号独立 try/catch。
+ *
+ * 失败隔离：一个账号的 401 / 网络错误不影响其它账号；每个账号的错误各自收集到
+ * 自己的 `error` 里，整体仍返回 200（UI 要展示「谁成功、谁失败、为什么」）。
+ *
+ * @param {(credential: object, options: { day: string }) => Promise<object>} deps.sweep
+ *   实际清扫函数（默认 `runGrowthSweep`，测试可 mock）。
+ * @param {(provider: string, accountId: string, amount: number) => void} [deps.recordGrant]
+ *   台账写入钩子（默认写 `creditUsageFile()`），每个账号**各自**记一条。
+ * @returns {Promise<{ provider: string, accounts: Array<{accountId, nickname, result?, error?}>, totals: object }>}
+ */
+export async function runGrowthSweepForProvider(deps) {
+  const provider = deps.provider
+  const day = deps.day ?? utc8Day()
+  const sweep = deps.sweep ?? runGrowthSweep
+  const recordGrant = deps.recordGrant
+  const accounts = resolveGrowthAccounts(provider)
+  const rows = []
+  const totals = { accounts: accounts.length, swept: 0, failed: 0, claimedTasks: 0, claimedCredits: 0, streakDays: undefined, unfinishableCount: 0, unfinishableCredits: 0 }
+
+  for (const account of accounts) {
+    try {
+      const result = await sweep(account.credential, { day })
+      const credits = Number(result?.claimedCredits) > 0 ? Number(result.claimedCredits) : 0
+      // 台账：**按真实 accountId** 记，不再是空串。
+      // 原先传 `''` 会让 `grantedSince()` 退化成「按 provider 匹配」，
+      // 多账号时会把 A 账号的奖励算到 B 账号头上（credit-usage.js:245-246）。
+      if (credits > 0) recordGrant?.(provider, account.accountId, credits, Date.now())
+      totals.swept += 1
+      totals.claimedTasks += Number(result?.claimedTasks) > 0 ? Number(result.claimedTasks) : 0
+      totals.claimedCredits += credits
+      // 成长任务绝大多数必须真实使用产品（参数见 workbuddy-growth.js 的
+      // unfinishable 注释）。把它汇总上去，UI 才能如实告诉用户「不是没跑，
+      // 是这些任务协议层做不到」—— 否则用户只看到「0 个任务」。
+      if (Array.isArray(result?.unfinishable)) totals.unfinishableCount += result.unfinishable.length
+      totals.unfinishableCredits += Number(result?.unfinishableCredits) > 0 ? Number(result.unfinishableCredits) : 0
+      if (typeof result?.streakDays === 'number') {
+        totals.streakDays = Math.max(totals.streakDays ?? 0, result.streakDays)
+      }
+      rows.push({ accountId: account.accountId, nickname: account.nickname, result })
+      deps.info?.(`auth-hub: ${provider}/${account.nickname || account.accountId} 成长清扫 任务+${result?.claimedTasks ?? 0} 积分+${credits}${Number(result?.unfinishableCredits) > 0 ? `（另有 ${result.unfinishable?.length ?? 0} 个任务需真实使用产品，+${result.unfinishableCredits} 积分）` : ''}`)
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      totals.failed += 1
+      rows.push({ accountId: account.accountId, nickname: account.nickname, error: message })
+      deps.warn?.(`auth-hub: ${provider}/${account.nickname || account.accountId} 成长清扫失败：${message}`)
+    }
+  }
+  return { provider, day, accounts: rows, totals }
+}
+
+/** `$DSH_HOME/channel-pack/growth-settings.json`：成长清扫的自动化配置。 */
+export function growthSettingsFile() {
+  return path.join(stateDir(), 'growth-settings.json')
+}
+
+/** `$DSH_HOME/channel-pack/growth-auto-state.json`：幂等判据（lastDay / attempts）。 */
+export function growthAutoStateFile() {
+  return path.join(stateDir(), 'growth-auto-state.json')
+}
+
+/**
+ * 自动成长清扫设置。
+ *
+ * ```json
+ * { "auto": true, "providers": ["workbuddy", "buddy"], "maxAttemptsPerDay": 2, "retryMinutes": 20 }
+ * ```
+ *
+ * 默认 `auto: false`（不替用户做决定）；`DSH_GROWTH_AUTO=1` 可强制开启，便于验证。
+ */
+export function readGrowthSettings(env = process.env) {
+  const raw = readJsonFile(growthSettingsFile(), {})
+  const source = raw !== null && typeof raw === 'object' ? raw : {}
+  const forced = String(env.DSH_GROWTH_AUTO ?? '') === '1'
+  const providers = Array.isArray(source.providers)
+    ? source.providers.filter(p => typeof p === 'string' && p !== '')
+    : ['workbuddy', 'buddy']
+  const attempts = Number(source.maxAttemptsPerDay)
+  const retry = Number(source.retryMinutes)
+  return {
+    auto: forced || source.auto === true,
+    providers: providers.length > 0 ? providers : ['workbuddy', 'buddy'],
+    maxAttemptsPerDay: Number.isFinite(attempts) && attempts > 0 ? Math.min(Math.trunc(attempts), 10) : 2,
+    retryMinutes: Number.isFinite(retry) && retry >= 0 ? Math.min(Math.trunc(retry), 360) : 20,
+  }
+}
+
+export function readGrowthAutoState() {
+  const raw = readJsonFile(growthAutoStateFile(), { version: 1, providers: {} })
+  const providers = raw !== null && typeof raw === 'object' && raw.providers !== null && typeof raw.providers === 'object' ? raw.providers : {}
+  return { version: 1, providers }
+}
+
+export function writeGrowthAutoState(next) {
+  try {
+    writeJsonFile(growthAutoStateFile(), next)
+    return next
+  } catch {
+    return next
+  }
 }
 
 /** `$DSH_HOME/.credentials.yaml`（不存在时返回空串，调用方按「未登录」处理）。 */
@@ -680,32 +822,62 @@ export function apply(ctx) {
             //
             // 凭据从 `state.json` 的 credentialRef 定位到 `.credentials.yaml` 里的条目，
             // 所以这里不额外存一份 token。
+            //
+            // ⚠️ v0.5.3 起 **POST 会遍历该 provider 下全部启用账号**（原先只扫第一个）。
+            // 返回结构对齐多账号：`{ accounts: [...], totals: {...}, result }`。
+            // `result` 保留为「第一个账号的原始结果」，让只读 `payload.result` 的旧
+            // 客户端在单账号场景下行为不变（向后兼容）。
             const provider = String(req.method === 'GET' ? (new URL(req.url ?? '/', 'http://x').searchParams.get('provider') ?? 'workbuddy') : '')
             try {
               if (req.method === 'GET') {
-                const credential = await resolveGrowthCredential(provider)
-                if (credential === undefined) return send(res, 200, { provider, signedIn: false })
+                const accounts = resolveGrowthAccounts(provider)
+                if (accounts.length === 0) return send(res, 200, { provider, signedIn: false })
+                const first = accounts[0]
                 const [status, tasks, streakDays, rewardToday] = await Promise.all([
-                  fetchGrowthStatus(credential).catch(() => undefined),
-                  fetchGrowthTasks(credential).catch(() => undefined),
-                  fetchGrowthStreakDays(credential).catch(() => undefined),
-                  fetchGrowthRewardToday(credential, utc8Day()).catch(() => undefined),
+                  fetchGrowthStatus(first.credential).catch(() => undefined),
+                  fetchGrowthTasks(first.credential).catch(() => undefined),
+                  fetchGrowthStreakDays(first.credential).catch(() => undefined),
+                  fetchGrowthRewardToday(first.credential, utc8Day()).catch(() => undefined),
                 ])
-                return send(res, 200, { provider, signedIn: true, status, tasks, streakDays, rewardToday })
+                return send(res, 200, {
+                  provider,
+                  signedIn: true,
+                  status,
+                  tasks,
+                  streakDays,
+                  rewardToday,
+                  // 多账号提示：UI 用它显示「共 N 个账号，当前展示第一个」
+                  accountId: first.accountId,
+                  nickname: first.nickname,
+                  accountCount: accounts.length,
+                })
               }
               if (req.method !== 'POST') return send(res, 405, { error: 'method not allowed' })
               if (!keyMatches(req.headers[CONTROL_KEY_HEADER])) return send(res, 403, { error: 'invalid-control-key' })
               const body = await readJson(req)
               const target = typeof body?.provider === 'string' ? body.provider : 'workbuddy'
-              const credential = await resolveGrowthCredential(target)
-              if (credential === undefined) return send(res, 400, { error: `no signed-in account for ${target}` })
-              const result = await runGrowthSweep(credential, { day: utc8Day() })
-              // 成长奖励也是「领取」，必须记入 grants，否则会被当成消耗之外的净减少。
-              if (Number(result.claimedCredits) > 0) {
-                recordCreditGrant(creditUsageFile(), target, '', Number(result.claimedCredits))
-              }
-              info(`auth-hub: ${target} 成长清扫 任务+${result.claimedTasks} 积分+${result.claimedCredits}`)
-              send(res, 200, { ok: true, provider: target, result })
+              // `ids` 可选：只清扫指定账号（UI 单账号重试 / 自动化定点补跑）。
+              const ids = Array.isArray(body?.ids) ? body.ids.filter(id => typeof id === 'string') : undefined
+              const accounts = resolveGrowthAccounts(target, { ids })
+              if (accounts.length === 0) return send(res, 400, { error: `no signed-in account for ${target}` })
+              const sweepResult = await runGrowthSweepForProvider({
+                provider: target,
+                day: utc8Day(),
+                ids,
+                // 台账：每个账号**各自**记一条，accountId 用真实 id。
+                recordGrant: (p, accountId, amount, at) => recordCreditGrant(creditUsageFile(), p, accountId, amount, at),
+                info,
+                warn,
+              })
+              const firstOk = sweepResult.accounts.find(row => row.result !== undefined)
+              info(`auth-hub: ${target} 成长清扫 ${sweepResult.totals.swept}/${sweepResult.totals.accounts} 个账号成功，任务+${sweepResult.totals.claimedTasks} 积分+${sweepResult.totals.claimedCredits}`)
+              send(res, 200, {
+                ok: true,
+                provider: target,
+                ...sweepResult,
+                // 向后兼容：单账号（且成功）时 `result` 就是那一份原始结果。
+                result: firstOk?.result,
+              })
             } catch (error) {
               send(res, 500, { error: error instanceof Error ? error.message : String(error) })
             }
@@ -927,6 +1099,88 @@ export function apply(ctx) {
             clearTimeout(boot)
           }
         }, 'auth-hub: checkin scheduler'),
+        // ── 成长清扫的自动执行（本地补丁 9）──────────────────────────────────
+        //
+        // 与签到调度器同款思路：**幂等判据比较日期**，不用 setTimeout 算到下一个
+        // 整点（机器休眠/唤醒会让定时器漂，日期判据怎么漂都不会漏跑或重跑）。
+        //
+        // 默认**关闭**（`auto: false`）：成长清扫是「帮用户领钱」，但用户可能想
+        // 自己控制时机；而且它会在上游产生真实请求，不能默认替用户决定。
+        // 开启方式：`$DSH_HOME/channel-pack/growth-settings.json` 写
+        //   `{ "auto": true, "providers": ["workbuddy","buddy"] }`
+        // 或环境变量 `DSH_GROWTH_AUTO=1`。
+        //
+        // 失败策略：**不重试到天荒地老**。成长中心是送钱操作，不是关键路径；
+        // 一天最多跑 `maxAttemptsPerDay`（默认 2）次，每次之间至少间隔 20 分钟。
+        scoped.effect(() => {
+          let stopped = false
+          const tick = async () => {
+            if (stopped) return
+            try {
+              const settings = readGrowthSettings()
+              if (settings.auto !== true) return
+              const state = readGrowthAutoState()
+              const day = utc8Day()
+              const nowMs = Date.now()
+              const providers = settings.providers.filter(p => {
+                const row = state.providers?.[p]
+                if (row === undefined) return true
+                if (row.lastDay !== day) return true
+                // 今天跑过：只有失败的才按间隔重试，成功的当天不再动（防重复领取）
+                if (row.lastStatus === 'ok') return false
+                if ((row.attempts ?? 0) >= settings.maxAttemptsPerDay) return false
+                return nowMs - (row.lastAt ?? 0) >= settings.retryMinutes * 60_000
+              })
+              if (providers.length === 0) return
+              const nextState = { version: 1, providers: { ...(state.providers ?? {}) } }
+              for (const provider of providers) {
+                const prev = nextState.providers[provider] ?? { attempts: 0, lastDay: '' }
+                const attempts = prev.lastDay === day ? (prev.attempts ?? 0) + 1 : 1
+                try {
+                  const swept = await runGrowthSweepForProvider({
+                    provider,
+                    day,
+                    recordGrant: (p, accountId, amount, at) => recordCreditGrant(creditUsageFile(), p, accountId, at),
+                    info,
+                    warn,
+                  })
+                  nextState.providers[provider] = {
+                    lastDay: day,
+                    lastAt: Date.now(),
+                    attempts,
+                    // 只要有账号成功就算 ok；全部失败才算 error（触发下次重试）
+                    lastStatus: swept.totals.swept > 0 ? 'ok' : 'error',
+                    lastError: swept.totals.failed > 0
+                      ? swept.accounts.filter(row => row.error !== undefined).map(row => `${row.nickname || row.accountId}: ${row.error}`).join('; ').slice(0, 400)
+                      : '',
+                  }
+                  if (swept.totals.swept > 0) {
+                    info(`auth-hub: 自动成长清扫 ${provider} ${swept.totals.swept}/${swept.totals.accounts} 个账号，积分+${swept.totals.claimedCredits}（${day}）`)
+                  }
+                } catch (error) {
+                  nextState.providers[provider] = {
+                    lastDay: day,
+                    lastAt: Date.now(),
+                    attempts,
+                    lastStatus: 'error',
+                    lastError: (error instanceof Error ? error.message : String(error)).slice(0, 400),
+                  }
+                }
+              }
+              writeGrowthAutoState(nextState)
+            } catch (error) {
+              warn(`auth-hub: 自动成长清扫扫描失败：${error instanceof Error ? error.message : String(error)}`)
+            }
+          }
+          const timer = setInterval(() => { void tick() }, 15 * 60_000)
+          // 挂载后 90 秒补一次：成长清扫不是关键路径，避开启动高峰（签到先跑）。
+          const boot = setTimeout(() => { void tick() }, 90_000)
+          return () => {
+            stopped = true
+            clearInterval(timer)
+            clearTimeout(boot)
+          }
+        }, 'auth-hub: growth scheduler'),
       ]
       return () => { for (const dispose of disposers) dispose() }
     }, 'auth-hub: account routes')

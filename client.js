@@ -6,7 +6,7 @@
  * 状态 chip、胶囊按钮，颜色全部取自 DSH 主题变量（`--dsw-alias-*`）。
  *
  * 四个分区：
- *   1. 渠道账号 —— 13 个渠道的账号 / 余额 / 签到状态（**折叠状态就显示**），可登录、
+ *   1. 渠道账号 —— 内置渠道的账号 / 余额 / 签到状态（**折叠状态就显示**，数量由 host 动态下发），可登录、
  *      领取、续期、停用、删除；可开「自动补签」。
  *   2. 签到渠道 —— **自己加的**每日签到站点（粘 Cookie / 粘 cURL 即可），自动签到
  *      并把奖励记进同一个积分台账。
@@ -17,7 +17,7 @@
  *   5. WorkBuddy —— 国内版 / 国际版。
  *
  * 数据与动作都**不复制**后端逻辑：
- *   - 13 个渠道：宿主 connection 的 RPC `/api/channel-pack`（方法名与它自己的
+ *   - 内置渠道：宿主 connection 的 RPC `/api/channel-pack`（方法名与它自己的
  *     界面一致：account.* / login.poll / credits.status / credits.balances /
  *     credits.claimAll / usage.autoCheckin / model.list）。
  *   - 积分上限与余额采样：本插件自己的 `/plugins/dsh-auth-hub/{policy,credit-sample}`。
@@ -38,22 +38,67 @@ window.__ModuleLoader__.load({
     const { createElement: h, Fragment, useState, useEffect, useMemo, useRef, useCallback } = React
 
     //#region 平台注册表
-    /** dsh-our-free-model 的 13 个账号渠道（`provider` 原样透传给 channel-pack）。 */
-    const CHANNEL_PLATFORMS = [
-      { provider: 'workbuddy', label: 'WorkBuddy 渠道', hint: '浏览器授权登录' },
-      { provider: 'buddy', label: 'CodeBuddy', hint: '浏览器授权登录' },
-      { provider: 'codearts', label: '华为 CodeArts', hint: '浏览器授权登录（AK/SK）' },
-      { provider: 'qoder', label: 'Qoder 国际版', hint: '浏览器授权登录' },
-      { provider: 'qodercn', label: 'Qoder 国内版', hint: '浏览器授权登录 · 每日 10:00 刷新' },
-      { provider: 'trae', label: 'TRAE', hint: '浏览器授权登录' },
-      { provider: 'cline', label: 'Cline', hint: '设备码轮询' },
-      { provider: 'lobsterai', label: '有道 LobsterAI', hint: '扫码 / 短信' },
-      { provider: 'loomy', label: '讯飞 Loomy', hint: '扫码 / 短信' },
-      { provider: 'raccoon', label: '商汤 Raccoon', hint: '浏览器授权登录' },
-      { provider: 'minimax', label: 'MiniMax', hint: '浏览器授权登录' },
-      { provider: 'zcode', label: 'ZCode / Z.ai', hint: '需要过验证码' },
-      { provider: 'gemini', label: 'Gemini', hint: '浏览器授权登录' },
-    ]
+    /**
+     * 渠道外观（label / hint）的**字典**，不是清单。
+     *
+     * 历史：这里原本是写死的 13 项数组，导致「host 注册了哪些 provider」与
+     * 「界面能显示哪些」是两套事实 —— 加渠道必须同时改 host 与 client，
+     * 漏一处就静默不显示（opencode 就是这样被漏掉的）。
+     *
+     * 现在改成「字典 + 运行时发现」：
+     *   · 有哪些渠道 → 问 host（`platform.list`，源自 `modelAdapters`，唯一事实源）
+     *   · 长什么样   → 查本字典；查不到的用 `fallbackPlatform()` 兜底
+     *
+     * 所以新增一个渠道时，**只需在 host 侧注册 adapter**；本字典是可选的
+     * 美化项（不写也能显示，只是 label 用 provider id）。
+     */
+    const PLATFORM_APPEARANCE = {
+      workbuddy: { label: 'WorkBuddy 渠道', hint: '浏览器授权登录' },
+      buddy: { label: 'CodeBuddy', hint: '浏览器授权登录' },
+      codearts: { label: '华为 CodeArts', hint: '浏览器授权登录（AK/SK）' },
+      qoder: { label: 'Qoder 国际版', hint: '浏览器授权登录' },
+      qodercn: { label: 'Qoder 国内版', hint: '浏览器授权登录 · 每日 10:00 刷新' },
+      trae: { label: 'TRAE', hint: '浏览器授权登录' },
+      cline: { label: 'Cline', hint: '设备码轮询' },
+      lobsterai: { label: '有道 LobsterAI', hint: '扫码 / 短信' },
+      loomy: { label: '讯飞 Loomy', hint: '扫码 / 短信' },
+      raccoon: { label: '商汤 Raccoon', hint: '浏览器授权登录' },
+      minimax: { label: 'MiniMax', hint: '浏览器授权登录' },
+      zcode: { label: 'ZCode / Z.ai', hint: '需要过验证码' },
+      gemini: { label: 'Gemini', hint: '浏览器授权登录' },
+      kimi: { label: 'Kimi Code', hint: 'OAuth 设备码（浏览器输入 user code）' },
+      opencode: { label: 'OpenCode', hint: '免费档（常被限流）' },
+    }
+
+    /**
+     * 未在字典里的 provider 的兜底外观。
+     *
+     * 之所以要兜底而不是丢弃：第三方渠道插件（Kimi Code / Command Code /
+     * SuperGrok …）注册到 `ctx.llm` 后本插件就能给它们做轮换与积分上限，
+     * 但它们的名字本插件不认识。丢弃等于「装了也用不上」。
+     */
+    const fallbackPlatform = provider => ({
+      provider,
+      label: provider.charAt(0).toUpperCase() + provider.slice(1),
+      hint: '第三方渠道（由其它插件注册）',
+      unknown: true,
+    })
+
+    /** 把 host 给的 provider id 列表套上外观。顺序以 host 为准（注册顺序）。 */
+    const buildPlatforms = providers => (Array.isArray(providers) ? providers : [])
+      .filter(provider => typeof provider === 'string' && provider !== '')
+      .map(provider => (PLATFORM_APPEARANCE[provider] !== undefined
+        ? { provider, ...PLATFORM_APPEARANCE[provider] }
+        : fallbackPlatform(provider)))
+
+    /**
+     * 兜底清单：仅当 `platform.list` 取不到时用（旧版 host / RPC 未就绪）。
+     * 必须与 host 侧的 `modelAdapters` 键保持一致，否则会显示不存在的渠道。
+     */
+    const FALLBACK_PLATFORMS = buildPlatforms([
+      'workbuddy', 'buddy', 'codearts', 'qoder', 'qodercn', 'trae',
+      'cline', 'lobsterai', 'loomy', 'raccoon', 'minimax', 'zcode', 'gemini',
+    ])
 
     /**
      * WorkBuddy 两态：国际版走 www.workbuddy.ai，国内版与 CodeBuddy 共用
@@ -580,8 +625,20 @@ window.__ModuleLoader__.load({
           const accountId = value?.accountId
           const url = value?.loginUrl
           if (typeof accountId !== 'string' || accountId === '') throw new Error('渠道未返回账号占位 id')
-          if (typeof url === 'string' && url !== '') openExternal(url)
-          setLogin({ accountId, url: typeof url === 'string' ? url : '', startedAt: Date.now() })
+          // device flow（Kimi 等）：上游给 verification_uri_complete（带 user_code 的
+          // 直达链接）时优先打开它——用户无需手输 code。裸 userCode 也展示出来，
+          // 万一直达链接没生效，用户还能在 verification_uri 页面手动输入。
+          const urlComplete = typeof value?.loginUrlComplete === 'string' && value.loginUrlComplete !== ''
+            ? value.loginUrlComplete : ''
+          const openUrl = urlComplete !== '' ? urlComplete : (typeof url === 'string' ? url : '')
+          if (openUrl !== '') openExternal(openUrl)
+          setLogin({
+            accountId,
+            url: typeof url === 'string' ? url : '',
+            urlComplete,
+            userCode: typeof value?.userCode === 'string' ? value.userCode : '',
+            startedAt: Date.now(),
+          })
           setOpen(true)
           onRefresh(true)
         } catch (error) { onError(platform, error) } finally { setBusy('') }
@@ -654,11 +711,28 @@ window.__ModuleLoader__.load({
               h('span', { style: statusStyle }, '等待浏览器完成登录…'),
               h('span', { style: accountMetaStyle }, `剩余 ${remainingText(login.startedAt)}`),
             ]),
+            // device flow（Kimi 等）：把 user code 大字展示出来 ——
+            // 上游给的是 verification_uri（不带 code），用户必须在页面里输入它。
+            login.userCode !== '' ? h('div', { style: { ...rowStyle, alignItems: 'center', gap: 8 } }, [
+              h('span', { style: accountMetaStyle }, '在打开的页面输入：'),
+              h('span', {
+                style: {
+                  fontFamily: 'monospace', fontSize: 15, fontWeight: 600,
+                  letterSpacing: 1.5, padding: '2px 10px',
+                  border: '1px solid var(--dsw-alias-border-strong, #888)', borderRadius: 6,
+                  userSelect: 'text',
+                },
+              }, login.userCode),
+              h('button', {
+                type: 'button', style: linkStyle,
+                onClick: () => { try { void navigator.clipboard.writeText(login.userCode) } catch { /* 剪贴板不可用就手输 */ } },
+              }, '复制'),
+            ]) : null,
             h('div', { style: progressTrackStyle }, h('div', {
               style: { ...progressBarStyle, width: `${Math.min(100, ((Date.now() - login.startedAt) / LOGIN_TIMEOUT_MS) * 100)}%` },
             })),
             h('div', { style: accountActionsStyle }, [
-              login.url !== '' ? h('button', { key: 'reopen', type: 'button', style: linkStyle, onClick: () => openExternal(login.url) }, '重新打开登录页') : null,
+              login.url !== '' ? h('button', { key: 'reopen', type: 'button', style: linkStyle, onClick: () => openExternal(login.urlComplete !== '' ? login.urlComplete : login.url) }, login.urlComplete !== '' ? '重新打开授权页' : '重新打开登录页') : null,
               h(ActionButton, { key: 'cancel', small: true, onClick: () => setLogin(null) }, '取消'),
             ]),
           ]) : null,
@@ -726,7 +800,7 @@ window.__ModuleLoader__.load({
     /**
      * 「签到渠道」分区。
      *
-     * 与上面 13 个渠道的本质区别：那些是**内置**的（登录协议写在 pack 里），这些是
+     * 与上面内置渠道的本质区别：那些是**内置**的（登录协议写在 pack 里），这些是
      * **用户自己加的**（一条 HTTP 模板 + 规则）。所以这里提供三种上手方式，按省事
      * 程度排序：
      *
@@ -2087,6 +2161,8 @@ window.__ModuleLoader__.load({
       const [login, setLogin] = useState(null)
       const [growth, setGrowth] = useState(undefined)
       const [growthError, setGrowthError] = useState('')
+      // 多账号清扫的逐个结果（来自 Host 的 `accounts[]`）；undefined = 还没跑过 / 单账号旧响应
+      const [growthAccounts, setGrowthAccounts] = useState(undefined)
 
       const accounts = entry?.accounts
       const status = entry?.status
@@ -2148,17 +2224,66 @@ window.__ModuleLoader__.load({
         try {
           if (controlKey === '') throw new Error('拿不到 controlKey（Host 半身未加载）')
           const payload = await postGrowthSweep(controlKey, channel.provider)
-          const result = payload?.result ?? {}
-          const parts = []
-          if (result.accepted > 0) parts.push(`接收 ${result.accepted} 个任务`)
-          if (result.claimedTasks > 0) parts.push(`领取 ${result.claimedTasks} 个任务`)
-          if (result.claimedCredits > 0) parts.push(`+${result.claimedCredits} 积分`)
-          if (result.trip?.dispatched === true) parts.push('已派猫猫出门')
-          if (result.trip?.reason === 'traveling') parts.push('猫猫还在路上')
-          if (result.trip?.reason === 'daily-limit') parts.push('今日旅行已达上限')
-          if (result.streakDays !== undefined) parts.push(`连登 ${result.streakDays} 天`)
-          if (Array.isArray(result.errors) && result.errors.length > 0) parts.push(`${result.errors.length} 步失败`)
-          setNotice(parts.length > 0 ? parts.join('，') : '没有可领取的')
+          // 多账号：Host 侧现在会遍历该 provider 下**全部启用账号**，
+          // 返回 `{ accounts: [{accountId, nickname, result?, error?}], totals }`。
+          // 单账号旧响应只有 `{ result }`，这里两条路径都兼容。
+          const rows = Array.isArray(payload?.accounts) ? payload.accounts : undefined
+          const totals = payload?.totals
+          if (rows !== undefined && totals !== undefined) {
+            const okRows = rows.filter(row => row.result !== undefined)
+            const badRows = rows.filter(row => row.error !== undefined)
+            const parts = [`${okRows.length}/${rows.length} 个账号`]
+            if (totals.claimedTasks > 0) parts.push(`领取 ${totals.claimedTasks} 个任务`)
+            if (totals.claimedCredits > 0) parts.push(`+${totals.claimedCredits} 积分`)
+            if (totals.streakDays !== undefined) parts.push(`连登 ${totals.streakDays} 天`)
+            // 诚实告知：成长任务绝大多数需要**真实使用产品**（召唤专家 / 用模板 /
+            // 设自动化 / 关注公众号满 24h），协议层无法完成（实测 /v2/report 是埋点，
+            // 成长 API 里没有任何写进度的通道）。不显示这一条，用户只会看到
+            // 「0 个任务 +0 积分」，以为清扫功能坏了 —— 这正是最初的投诉。
+            const unfinishableCount = Number(totals.unfinishableCount) > 0
+              ? Number(totals.unfinishableCount)
+              : rows.reduce((sum, row) => sum + (Array.isArray(row.result?.unfinishable) ? row.result.unfinishable.length : 0), 0)
+            const unfinishableCredits = Number(totals.unfinishableCredits) > 0
+              ? Number(totals.unfinishableCredits)
+              : rows.reduce((sum, row) => sum + (Number(row.result?.unfinishableCredits) || 0), 0)
+            if (unfinishableCount > 0) {
+              parts.push(unfinishableCredits > 0
+                ? `${unfinishableCount} 个任务需真实使用产品（+${unfinishableCredits} 积分待操作）`
+                : `${unfinishableCount} 个任务需真实使用产品`)
+            }
+            if (badRows.length > 0) parts.push(`${badRows.length} 个失败`)
+            setNotice(parts.join('，'))
+            // 失败必须说清是哪个账号、什么原因（不能只报个总数）。
+            setGrowthAccounts(rows.map(row => ({
+              accountId: row.accountId,
+              nickname: row.nickname,
+              ok: row.result !== undefined,
+              credits: Number(row.result?.claimedCredits) > 0 ? Number(row.result.claimedCredits) : 0,
+              tasks: Number(row.result?.claimedTasks) > 0 ? Number(row.result.claimedTasks) : 0,
+              error: row.error,
+            })))
+          } else {
+            const result = payload?.result ?? {}
+            const parts = []
+            if (result.accepted > 0) parts.push(`接收 ${result.accepted} 个任务`)
+            if (result.claimedTasks > 0) parts.push(`领取 ${result.claimedTasks} 个任务`)
+            if (result.claimedCredits > 0) parts.push(`+${result.claimedCredits} 积分`)
+            if (result.trip?.dispatched === true) parts.push('已派猫猫出门')
+            if (result.trip?.reason === 'traveling') parts.push('猫猫还在路上')
+            if (result.trip?.reason === 'daily-limit') parts.push('今日旅行已达上限')
+            if (result.streakDays !== undefined) parts.push(`连登 ${result.streakDays} 天`)
+            if (Array.isArray(result.errors) && result.errors.length > 0) parts.push(`${result.errors.length} 步失败`)
+            // 同多账号分支：如实告知「这些任务协议层做不到」，而不是让用户
+            // 看到「没有可领取的」就以为功能坏了。
+            if (Array.isArray(result.unfinishable) && result.unfinishable.length > 0) {
+              const credits = Number(result.unfinishableCredits) || 0
+              parts.push(credits > 0
+                ? `${result.unfinishable.length} 个任务需真实使用产品（+${credits} 积分待操作）`
+                : `${result.unfinishable.length} 个任务需真实使用产品`)
+            }
+            setNotice(parts.length > 0 ? parts.join('，') : '没有可领取的')
+            setGrowthAccounts(undefined)
+          }
           await loadGrowth()
           onRefresh(true)
         } catch (error) { onError(channel, error) } finally { setBusy('') }
@@ -2216,6 +2341,23 @@ window.__ModuleLoader__.load({
           notice !== '' ? h('div', { key: 'notice', style: bodyStyle }, notice) : null,
           entry?.error !== undefined ? h('div', { key: 'err', style: errorStyle }, entry.error) : null,
           growthError !== '' ? h('div', { key: 'gerr', style: errorStyle }, `成长中心：${growthError}`) : null,
+          // 多账号清扫结果：逐个列出，失败的说清是哪个账号、什么原因。
+          Array.isArray(growthAccounts) && growthAccounts.length > 0
+            ? h('div', { key: 'gaccts', style: accountItemStyle },
+              growthAccounts.map(row => h('div', {
+                key: row.accountId,
+                style: { display: 'flex', justifyContent: 'space-between', gap: 8, fontSize: 12 },
+              }, [
+                h('span', { key: 'n', style: { color: 'var(--dsw-alias-label-secondary)' } },
+                  `${row.ok ? '✓' : '✗'} ${row.nickname || row.accountId}`),
+                h('span', {
+                  key: 'v',
+                  style: { color: row.ok ? 'var(--dsw-alias-label-primary)' : 'var(--dsw-alias-state-error-primary)', textAlign: 'right' },
+                }, row.ok
+                  ? [row.tasks > 0 ? `${row.tasks} 任务` : '', row.credits > 0 ? `+${row.credits}` : ''].filter(Boolean).join(' · ') || '无奖励'
+                  : String(row.error ?? '失败').slice(0, 120)),
+              ])))
+            : null,
           growth === null ? h('div', { key: 'gnone', style: accountMetaStyle }, '成长中心：未登录或无数据') : null,
           growth !== undefined && growth !== null ? h('div', { key: 'growth', style: accountItemStyle }, [
             h('div', { key: 'row', style: rowStyle }, [
@@ -2267,7 +2409,7 @@ window.__ModuleLoader__.load({
 
     //#region 账号中心主体
     /**
-     * 数据层：一次把 13 个渠道的「账号 / 签到状态 / 余额」拉回来。
+     * 数据层：一次把全部已发现渠道的「账号 / 签到状态 / 余额」拉回来。
      *
      * 不再等用户展开卡片 —— 折叠状态就要看到「N 个账号 · 余额 X · 今日已签」。
      * 并发上限 3：13 平台 × 3 接口 = 39 次调用，全并发会同时打出几十个上游请求
@@ -2295,6 +2437,21 @@ window.__ModuleLoader__.load({
        *    —— 那个错误会让整个分区渲染失败、页面一片空白（实测踩过）。
        */
       const [controlKey, setControlKey] = useState('')
+      /**
+       * 渠道清单：由 host 的 `platform.list` 下发（源自 `modelAdapters`，唯一事实源）。
+       *
+       * 初值是兜底清单（RPC 未就绪 / 旧版 host 时的可读降级），拿到 host 结果后覆盖。
+       * 这样「新增渠道」只需在 host 注册 adapter，界面自动跟随，不必再改本文件。
+       */
+      const [platforms, setPlatforms] = useState(FALLBACK_PLATFORMS)
+      /**
+       * 同进程里**其它插件**注册到 `ctx.llm` 的 provider（无本插件账号池）。
+       *
+       * 它们不进「渠道账号」卡片（没有登录/签到/余额可看），但会作为
+       * **轮换候选**出现在「按模型」页 —— 轮换引擎本来就是 provider-agnostic 的，
+       * 这样「装了第三方 provider 插件」才真的用得上。
+       */
+      const [externalPlatforms, setExternalPlatforms] = useState([])
       const claimedRef = useRef(new Set())
       const claimQueueRef = useRef(Promise.resolve())
 
@@ -2306,6 +2463,30 @@ window.__ModuleLoader__.load({
           .catch(() => { /* Host 半身没加载时保持空串，写操作会给出可读错误 */ })
         return () => { alive = false }
       }, [])
+
+      /**
+       * 问 host「现在装了哪些渠道」。
+       *
+       * 失败时**保持兜底清单**而不是清空 —— 宁可少显示，也不能让整页变空。
+       */
+      useEffect(() => {
+        if (!channelAvailable) return undefined
+        let alive = true
+        void rpc('platform.list', {}, 15_000)
+          .then(value => {
+            if (!alive) return
+            // host 分两类返回：pool = 本插件账号池渠道（完整卡片），
+            // others = 其它插件注册到 ctx.llm 的 provider（只进轮换候选）。
+            // providers 是向后兼容用的合并视图。
+            const pool = Array.isArray(value?.pool) ? value.pool : value?.providers
+            const discovered = buildPlatforms(pool)
+            if (discovered.length > 0) setPlatforms(discovered)
+            const extra = buildPlatforms(value?.others).filter(p => !discovered.some(d => d.provider === p.provider))
+            setExternalPlatforms(extra)
+          })
+          .catch(() => { /* 老 host 没这个 RPC：静默保留兜底 */ })
+        return () => { alive = false }
+      }, [channelAvailable, rpc])
 
       const reportError = useCallback((scope, caught) => {
         const actual = caught === undefined ? scope : caught
@@ -2368,7 +2549,7 @@ window.__ModuleLoader__.load({
       const refreshAll = useCallback(async force => {
         if (!channelAvailable) return
         setError('')
-        const list = CHANNEL_PLATFORMS.map(platform => platform.provider)
+        const list = platforms.map(platform => platform.provider)
         let cursor = 0
         const workers = Array.from({ length: Math.min(LOAD_CONCURRENCY, list.length) }, async () => {
           while (cursor < list.length) {
@@ -2383,7 +2564,7 @@ window.__ModuleLoader__.load({
         await Promise.all(workers)
         setUpdatedAt(Date.now())
         // 账号渠道的模型目录随「全部刷新」一起重读（逐 provider 的 model.list）。
-      }, [channelAvailable, loadProvider, scheduleAutoClaim, reportError])
+      }, [channelAvailable, platforms, loadProvider, scheduleAutoClaim, reportError])
 
 
       const loadAutoCheckin = useCallback(async () => {
@@ -2425,12 +2606,12 @@ window.__ModuleLoader__.load({
         return text
       }, [claimProvider, loadProvider])
 
-      const pendingClaims = CHANNEL_PLATFORMS
+      const pendingClaims = platforms
         .filter(platform => (providers ?? {})[platform.provider]?.status?.active === true && (providers ?? {})[platform.provider]?.status?.todayCheckedIn !== true)
         .map(platform => platform.label)
 
       const channelsBody = channelAvailable
-        ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } }, CHANNEL_PLATFORMS.map(platform => h(ChannelPlatformCard, {
+        ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 10 } }, platforms.map(platform => h(ChannelPlatformCard, {
           key: platform.provider,
           platform,
           rpc,
@@ -2452,7 +2633,7 @@ window.__ModuleLoader__.load({
           onError: reportError,
         })))
       const tabs = [
-        { id: 'channels', label: `渠道账号（${CHANNEL_PLATFORMS.length}）` },
+        { id: 'channels', label: `渠道账号（${platforms.length}）` },
         { id: 'checkin', label: '签到渠道' },
         { id: 'models', label: '按模型' },
         { id: 'credits', label: '积分上限' },
@@ -2468,7 +2649,7 @@ window.__ModuleLoader__.load({
         }, [
           h('span', { key: 'text', style: headTextStyle }, [
             h('span', { key: 'name', style: nameStyle }, '账号中心'),
-            h('span', { key: 'desc', style: descriptionStyle }, '13 个渠道账号 + WorkBuddy 的登录、余额、签到；自己加的签到渠道；按模型看账号；组合轮换与每日限量'),
+            h('span', { key: 'desc', style: descriptionStyle }, `${platforms.length} 个渠道账号 + WorkBuddy 的登录、余额、签到；自己加的签到渠道；按模型看账号；组合轮换与每日限量`),
           ]),
           h(ChevronDownOutline14, { key: 'chev', open }),
         ]),
@@ -2502,12 +2683,13 @@ window.__ModuleLoader__.load({
             tab === 'checkin' ? h(CheckinTab, { controlKey, onError: reportError }) : null,
             tab === 'models' ? h(AccountModelTab, {
               rpc,
-              platforms: CHANNEL_PLATFORMS,
+              // 轮换候选 = 账号池渠道 + 第三方 provider（后者无账号但可轮换）
+              platforms: [...platforms, ...externalPlatforms],
               providers,
               onError: reportError,
             }) : null,
             tab === 'credits' ? h(CreditCapTab, {
-              platforms: CHANNEL_PLATFORMS,
+              platforms,
               providers,
               onError: reportError,
             }) : null,

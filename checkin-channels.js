@@ -3,7 +3,7 @@
  *
  * ## 为什么不直接往 pack.js 里加渠道
  *
- * 内置 channel-pack 的 13 个渠道全是「官方客户端」形态：浏览器授权 / 扫码 /
+ * 内置 channel-pack 的渠道全是「官方客户端」形态：浏览器授权 / 扫码 /
  * 设备码，拿 OAuth 令牌，协议各自定制（CodeBuddy 的 X-Conversation 头、ZCode
  * 的验证码、CodeArts 的 AK/SK…）。每加一个都要先逆向它的登录与请求，是以周计
  * 的活，而且逆向结果随时会随上游改版失效。
